@@ -1,0 +1,29 @@
+version: "1"
+
+source:
+  path: ./source
+
+target:
+  workspaces:
+    networking:
+      path: ./target-net
+    compute:
+      path: ./target-compute
+
+migration:
+  moves:
+    # Networking resources -> networking workspace
+    - from: "null_resource.vpc"
+      to: { workspace: networking, resource: "null_resource.vpc" }
+    - from: "null_resource.subnet_public"
+      to: { workspace: networking, resource: "null_resource.subnet_public" }
+    - from: "null_resource.subnet_private"
+      to: { workspace: networking, resource: "null_resource.subnet_private" }
+    # Compute resources -> compute workspace
+    - from: "null_resource.web_server"
+      to: { workspace: compute, resource: "null_resource.web_server" }
+    - from: "null_resource.api_server"
+      to: { workspace: compute, resource: "null_resource.api_server" }
+
+tf:
+  tool: tofu

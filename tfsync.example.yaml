@@ -1,0 +1,65 @@
+# tfsync configuration example
+# See README.md for full documentation
+
+version: "1"
+
+# Source: where to pull state from (uses configured backend)
+source:
+  path: ./terraform/old
+
+# Target: where to test the migration (uses local state)
+target:
+  path: ./terraform/new
+
+# Migration: how to transform the state
+migration:
+  # Inline state moves (recommended)
+  moves:
+    - from: "aws_s3_bucket.data"
+      to: "module.storage.aws_s3_bucket.main"
+    - from: "aws_iam_role.app"
+      to: "module.iam.aws_iam_role.application"
+
+  # Or use an external script for complex migrations
+  # script: ./migrate.sh
+
+# Optional: terraform/tofu settings
+terraform:
+  binary: tofu          # or "terraform"
+  parallelism: 10
+  # var_files:
+  #   - terraform.tfvars
+  # vars:
+  #   - "environment=test"
+
+# Optional: cleanup behavior
+cleanup:
+  on_success: true
+  on_failure: false
+
+---
+# Multi-workspace example: splitting one state into multiple
+
+# version: "1"
+#
+# source:
+#   path: ./terraform/monolith
+#
+# target:
+#   workspaces:
+#     networking:
+#       path: ./terraform/networking
+#     compute:
+#       path: ./terraform/compute
+#
+# migration:
+#   moves:
+#     - from: "aws_vpc.main"
+#       to: "aws_vpc.main"
+#       target_workspace: networking
+#     - from: "aws_subnet.public"
+#       to: "aws_subnet.public"
+#       target_workspace: networking
+#     - from: "aws_instance.app"
+#       to: "aws_instance.app"
+#       target_workspace: compute

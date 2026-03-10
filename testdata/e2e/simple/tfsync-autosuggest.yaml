@@ -1,0 +1,12 @@
+version: "1"
+
+source:
+  path: ./source
+
+target:
+  path: ./target
+
+# No migration section - autosuggest will generate it
+
+tf:
+  tool: tofu

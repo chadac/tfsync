@@ -1,0 +1,16 @@
+version: "1"
+
+source:
+  path: ./source
+
+target:
+  workspaces:
+    networking:
+      path: ./target-net
+    compute:
+      path: ./target-compute
+
+# No migration section - autosuggest will generate it
+
+tf:
+  tool: tofu

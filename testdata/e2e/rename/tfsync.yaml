@@ -1,0 +1,23 @@
+version: "1"
+
+source:
+  path: ./source
+
+target:
+  path: ./target
+
+migration:
+  moves:
+    - from: "null_resource.db_prod_main"
+      to: "null_resource.main_database"
+    - from: "null_resource.db_prod_replica"
+      to: "null_resource.replica_database"
+    - from: "null_resource.cache_prod_sessions"
+      to: "null_resource.sessions_cache"
+    - from: "null_resource.server_prod_web"
+      to: "null_resource.web_server"
+    - from: "null_resource.server_prod_api"
+      to: "null_resource.api_server"
+
+tf:
+  tool: tofu

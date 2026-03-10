@@ -1,0 +1,19 @@
+version: "1"
+
+source:
+  path: ./source
+
+target:
+  path: ./target
+
+migration:
+  moves:
+    - from: "null_resource.database"
+      to: "module.data.null_resource.database"
+    - from: "null_resource.cache"
+      to: "module.data.null_resource.cache"
+    - from: "null_resource.app_server"
+      to: "module.compute.null_resource.app_server"
+
+tf:
+  tool: tofu

@@ -1,0 +1,28 @@
+# Build artifacts
+/tfsync
+/result
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+backend_override.tf
+
+# tfsync generated
+*.tfsync-backup

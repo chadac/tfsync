@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go:*)",
+      "Bash(which:*)",
+      "Bash(nix:*)",
+      "mcp__emacs__lock_file(*)",
+      "Bash(mkdir:*)",
+      "mcp__emacs__save_buffer(*)",
+      "Bash(./tfsync:*)",
+      "Bash(rm:*)",
+      "Bash(cd:*)",
+      "Bash(ls:*)",
+      "Bash(pwd:*)",
+      "Bash(/home/chadac/code/github.com/chadac/tfsync/tfsync:*)",
+      "Bash(./result/bin/tfsync:*)",
+      "Bash(git:*)"
+    ]
+  }
+}
