@@ -3,6 +3,8 @@ package internal
 import (
 	"os"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestExpandEnv(t *testing.T) {
@@ -370,7 +372,7 @@ func TestConfigValidation(t *testing.T) {
 				Source:  Source{Path: "/source"},
 				Target:  Target{Path: "/target"},
 				Migration: Migration{
-					Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}},
+					Moves: []Move{{From: MoveFrom{Resource: "a.b"}, To: MoveTo{Resource: "c.d"}}},
 				},
 			},
 			expectError: false,
@@ -380,7 +382,7 @@ func TestConfigValidation(t *testing.T) {
 			config: Config{
 				Source:    Source{Path: "/source"},
 				Target:    Target{Path: "/target"},
-				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+				Migration: Migration{Moves: []Move{{From: MoveFrom{Resource: "a.b"}, To: MoveTo{Resource: "c.d"}}}},
 			},
 			expectError: true,
 		},
@@ -390,7 +392,7 @@ func TestConfigValidation(t *testing.T) {
 				Version:   "2",
 				Source:    Source{Path: "/source"},
 				Target:    Target{Path: "/target"},
-				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+				Migration: Migration{Moves: []Move{{From: MoveFrom{Resource: "a.b"}, To: MoveTo{Resource: "c.d"}}}},
 			},
 			expectError: true,
 		},
@@ -400,7 +402,7 @@ func TestConfigValidation(t *testing.T) {
 				Version:   "1",
 				Source:    Source{},
 				Target:    Target{Path: "/target"},
-				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+				Migration: Migration{Moves: []Move{{From: MoveFrom{Resource: "a.b"}, To: MoveTo{Resource: "c.d"}}}},
 			},
 			expectError: true,
 		},
@@ -413,7 +415,7 @@ func TestConfigValidation(t *testing.T) {
 					Workspaces: map[string]Workspace{"dev": {Path: "/dev"}},
 				},
 				Target:    Target{Path: "/target"},
-				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+				Migration: Migration{Moves: []Move{{From: MoveFrom{Resource: "a.b"}, To: MoveTo{Resource: "c.d"}}}},
 			},
 			expectError: true,
 		},
@@ -429,5 +431,137 @@ func TestConfigValidation(t *testing.T) {
 				t.Errorf("Validate() = %v, want nil", err)
 			}
 		})
+	}
+}
+
+func TestMoveUnmarshalYAML(t *testing.T) {
+	tests := []struct {
+		name              string
+		yaml              string
+		expectedFromRes   string
+		expectedFromWS    string
+		expectedToRes     string
+		expectedToWS      string
+		expectError       bool
+	}{
+		{
+			name: "simple string from and to",
+			yaml: `
+from: "module.foo"
+to: "module.bar"
+`,
+			expectedFromRes: "module.foo",
+			expectedFromWS:  "",
+			expectedToRes:   "module.bar",
+			expectedToWS:    "",
+		},
+		{
+			name: "object from with workspace",
+			yaml: `
+from:
+  workspace: dev
+  resource: "module.foo"
+to: "module.bar"
+`,
+			expectedFromRes: "module.foo",
+			expectedFromWS:  "dev",
+			expectedToRes:   "module.bar",
+			expectedToWS:    "",
+		},
+		{
+			name: "object to with workspace",
+			yaml: `
+from: "module.foo"
+to:
+  workspace: prod
+  resource: "module.bar"
+`,
+			expectedFromRes: "module.foo",
+			expectedFromWS:  "",
+			expectedToRes:   "module.bar",
+			expectedToWS:    "prod",
+		},
+		{
+			name: "both from and to as objects",
+			yaml: `
+from:
+  workspace: dev
+  resource: "module.foo"
+to:
+  workspace: prod
+  resource: "module.bar"
+`,
+			expectedFromRes: "module.foo",
+			expectedFromWS:  "dev",
+			expectedToRes:   "module.bar",
+			expectedToWS:    "prod",
+		},
+		{
+			name: "deprecated target_workspace",
+			yaml: `
+from: "module.foo"
+to: "module.bar"
+target_workspace: legacy
+`,
+			expectedFromRes: "module.foo",
+			expectedFromWS:  "",
+			expectedToRes:   "module.bar",
+			expectedToWS:    "legacy",
+		},
+		{
+			name: "to.workspace overrides target_workspace",
+			yaml: `
+from: "module.foo"
+to:
+  workspace: new
+  resource: "module.bar"
+target_workspace: legacy
+`,
+			expectedFromRes: "module.foo",
+			expectedFromWS:  "",
+			expectedToRes:   "module.bar",
+			expectedToWS:    "new",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mv Move
+			err := yaml.Unmarshal([]byte(tt.yaml), &mv)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if mv.GetFromResource() != tt.expectedFromRes {
+				t.Errorf("GetFromResource() = %q, want %q", mv.GetFromResource(), tt.expectedFromRes)
+			}
+			if mv.GetFromWorkspace() != tt.expectedFromWS {
+				t.Errorf("GetFromWorkspace() = %q, want %q", mv.GetFromWorkspace(), tt.expectedFromWS)
+			}
+			if mv.GetToResource() != tt.expectedToRes {
+				t.Errorf("GetToResource() = %q, want %q", mv.GetToResource(), tt.expectedToRes)
+			}
+			if mv.GetToWorkspace() != tt.expectedToWS {
+				t.Errorf("GetToWorkspace() = %q, want %q", mv.GetToWorkspace(), tt.expectedToWS)
+			}
+		})
+	}
+}
+
+func TestMoveGetToResourceDefault(t *testing.T) {
+	// When To.Resource is empty, GetToResource should return From.Resource
+	mv := Move{
+		From: MoveFrom{Resource: "module.foo"},
+		To:   MoveTo{Workspace: "prod"}, // Resource empty
+	}
+
+	if got := mv.GetToResource(); got != "module.foo" {
+		t.Errorf("GetToResource() = %q, want %q", got, "module.foo")
 	}
 }

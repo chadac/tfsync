@@ -216,6 +216,9 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	// For multi source -> multi target, copy each source to corresponding target
 	rep.Header("Copying State")
 
+	// Collect source workspace resources for auto-detection
+	sourceResources := make(internal.SourceWorkspaceResources)
+
 	if cfg.Source.IsMultiWorkspace() {
 		// Multi-source: each source workspace maps to a target workspace
 		for wsName, srcWs := range sourceWorkspaces {
@@ -238,9 +241,15 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 				return fmt.Errorf("failed to resolve source path: %w", err)
 			}
 
-			if _, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig()); err != nil {
+			copyResult, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig())
+			if err != nil {
 				rep.Error("Failed to copy state: %v", err)
 				return err
+			}
+
+			// Collect source resources for this workspace
+			if copyResult.SourceResources != nil {
+				sourceResources[wsName] = copyResult.SourceResources
 			}
 
 			if err := copier.InitTargetWithLocalBackend(ctx, absTargetDir); err != nil {
@@ -267,9 +276,15 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 
 			rep.Step("Copying state: %s -> %s", srcWs.Path, targetWs.Path)
 
-			if _, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig()); err != nil {
+			copyResult, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig())
+			if err != nil {
 				rep.Error("Failed to copy state: %v", err)
 				return err
+			}
+
+			// For single source, store resources under "default"
+			if copyResult.SourceResources != nil && sourceResources["default"] == nil {
+				sourceResources["default"] = copyResult.SourceResources
 			}
 
 			if err := copier.InitTargetWithLocalBackend(ctx, absTargetDir); err != nil {
@@ -292,7 +307,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 			targetDirMap[wsName] = absDir
 		}
 		var err error
-		migrationResult, err = executor.ExecuteMultiWorkspace(ctx, &cfg.Migration, targetDirMap)
+		migrationResult, err = executor.ExecuteMultiWorkspaceWithSources(ctx, &cfg.Migration, sourceResources, targetDirMap)
 		if err != nil {
 			rep.Error("Migration failed: %v", err)
 			return err

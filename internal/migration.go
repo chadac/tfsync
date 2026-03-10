@@ -58,9 +58,10 @@ func (e *Executor) executeMoves(ctx context.Context, moves []Move, targetDir str
 	cli := NewCLI(e.binary, targetDir)
 
 	for i, mv := range moves {
+		fromResource := mv.GetFromResource()
 		toResource := mv.GetToResource()
-		if err := cli.StateMv(ctx, mv.From, toResource); err != nil {
-			return fmt.Errorf("move[%d] %q -> %q: %w", i, mv.From, toResource, err)
+		if err := cli.StateMv(ctx, fromResource, toResource); err != nil {
+			return fmt.Errorf("move[%d] %q -> %q: %w", i, fromResource, toResource, err)
 		}
 	}
 
@@ -85,30 +86,78 @@ func (e *Executor) executeScript(ctx context.Context, script, targetDir string) 
 	return nil
 }
 
+// SourceWorkspaceResources maps source workspace names to their resource addresses.
+// Used for auto-detecting which source workspace contains a resource.
+type SourceWorkspaceResources map[string][]string
+
 // ExecuteMultiWorkspace runs migrations for multi-workspace configurations.
 // It handles routing moves to the correct target workspace.
 // For workspace splits (copying full state then trimming), it:
 // 1. Groups moves by target workspace
 // 2. For each workspace, removes resources NOT assigned to it
 // 3. Performs any actual moves (where from != to address)
+//
+// Deprecated: Use ExecuteMultiWorkspaceWithSources for source workspace auto-detection.
 func (e *Executor) ExecuteMultiWorkspace(
 	ctx context.Context,
 	cfg *Migration,
 	targetWorkspaces map[string]string, // workspace name -> directory
 ) (*Result, error) {
+	return e.ExecuteMultiWorkspaceWithSources(ctx, cfg, nil, targetWorkspaces)
+}
+
+// ExecuteMultiWorkspaceWithSources runs migrations for multi-workspace configurations
+// with source workspace auto-detection support.
+//
+// sourceResources maps source workspace name -> list of resource addresses in that workspace.
+// When a move's source workspace is not specified, it will be auto-detected by finding
+// which source workspace contains the resource. An error is returned if the resource
+// exists in multiple source workspaces (ambiguous).
+func (e *Executor) ExecuteMultiWorkspaceWithSources(
+	ctx context.Context,
+	cfg *Migration,
+	sourceResources SourceWorkspaceResources, // workspace name -> resource addresses
+	targetWorkspaces map[string]string,       // workspace name -> directory
+) (*Result, error) {
 	result := &Result{}
 
-	// Group moves by target workspace
+	// Build reverse lookup: resource address -> source workspace(s)
+	resourceToSourceWS := make(map[string][]string)
+	for wsName, resources := range sourceResources {
+		for _, addr := range resources {
+			resourceToSourceWS[addr] = append(resourceToSourceWS[addr], wsName)
+		}
+	}
+
+	// Group moves by target workspace and resolve source workspaces
 	movesByWorkspace := make(map[string][]Move)
 	allSourceAddrs := make(map[string]string) // from addr -> target workspace
 
-	for _, mv := range cfg.Moves {
+	for i, mv := range cfg.Moves {
+		fromResource := mv.GetFromResource()
+		fromWorkspace := mv.GetFromWorkspace()
+
+		// Auto-detect source workspace if not specified
+		if fromWorkspace == "" && sourceResources != nil {
+			sourceWSs := resourceToSourceWS[fromResource]
+			switch len(sourceWSs) {
+			case 0:
+				// Resource not found in any source workspace - this is OK,
+				// it might be a resource that only exists in some workspaces
+			case 1:
+				fromWorkspace = sourceWSs[0]
+			default:
+				return result, fmt.Errorf("move[%d] %q: ambiguous source workspace, resource exists in multiple workspaces: %v. Please specify 'from: { workspace: \"...\", resource: \"%s\" }'",
+					i, fromResource, sourceWSs, fromResource)
+			}
+		}
+
 		ws := mv.GetToWorkspace()
 		if ws == "" {
 			ws = "default"
 		}
 		movesByWorkspace[ws] = append(movesByWorkspace[ws], mv)
-		allSourceAddrs[mv.From] = ws
+		allSourceAddrs[fromResource] = ws
 	}
 
 	// For each workspace:
@@ -137,10 +186,11 @@ func (e *Executor) ExecuteMultiWorkspace(
 		// Execute moves for this workspace (only where from != to)
 		moves := movesByWorkspace[wsName]
 		for i, mv := range moves {
+			fromResource := mv.GetFromResource()
 			toResource := mv.GetToResource()
-			if mv.From != toResource {
-				if err := cli.StateMv(ctx, mv.From, toResource); err != nil {
-					return result, fmt.Errorf("workspace %q: move[%d] %q -> %q: %w", wsName, i, mv.From, toResource, err)
+			if fromResource != toResource {
+				if err := cli.StateMv(ctx, fromResource, toResource); err != nil {
+					return result, fmt.Errorf("workspace %q: move[%d] %q -> %q: %w", wsName, i, fromResource, toResource, err)
 				}
 				result.MovesExecuted++
 			}
@@ -169,10 +219,14 @@ func (e *Executor) DryRun(cfg *Migration) []string {
 	var actions []string
 
 	for _, mv := range cfg.Moves {
+		fromResource := mv.GetFromResource()
 		toResource := mv.GetToResource()
-		action := fmt.Sprintf("state mv %q -> %q", mv.From, toResource)
+		action := fmt.Sprintf("state mv %q -> %q", fromResource, toResource)
+		if ws := mv.GetFromWorkspace(); ws != "" {
+			action += fmt.Sprintf(" (from workspace: %s)", ws)
+		}
 		if ws := mv.GetToWorkspace(); ws != "" {
-			action += fmt.Sprintf(" (workspace: %s)", ws)
+			action += fmt.Sprintf(" (to workspace: %s)", ws)
 		}
 		actions = append(actions, action)
 	}

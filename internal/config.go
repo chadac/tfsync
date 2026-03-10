@@ -87,15 +87,23 @@ type Migration struct {
 }
 
 // Move represents a single terraform state mv operation.
+// The `from` field supports two formats:
+//   - Simple string: "module.foo.null_resource.bar" (auto-detects source workspace)
+//   - Object: { workspace: "dev", resource: "module.foo.null_resource.bar" }
 // The `to` field supports two formats:
 //   - Simple string: "module.foo.null_resource.bar"
 //   - Object: { workspace: "networking", resource: "null_resource.bar" }
 type Move struct {
-	From string   `yaml:"from"`
+	From MoveFrom `yaml:"-"` // Custom unmarshaling
 	To   MoveTo   `yaml:"-"` // Custom unmarshaling
-	RawTo interface{} `yaml:"to"` // For unmarshaling
 	// TargetWorkspace is deprecated, use To.Workspace instead
 	TargetWorkspace string `yaml:"target_workspace,omitempty"`
+}
+
+// MoveFrom represents the source of a state move.
+type MoveFrom struct {
+	Resource  string // The resource address
+	Workspace string // Source workspace (for multi-workspace, empty means auto-detect)
 }
 
 // MoveTo represents the destination of a state move.
@@ -108,7 +116,7 @@ type MoveTo struct {
 func (m *Move) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// First unmarshal into a temporary struct
 	type rawMove struct {
-		From            string      `yaml:"from"`
+		From            interface{} `yaml:"from"`
 		To              interface{} `yaml:"to"`
 		TargetWorkspace string      `yaml:"target_workspace,omitempty"`
 	}
@@ -117,8 +125,25 @@ func (m *Move) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
-	m.From = raw.From
 	m.TargetWorkspace = raw.TargetWorkspace
+
+	// Handle the `from` field - can be string or object
+	switch from := raw.From.(type) {
+	case string:
+		m.From = MoveFrom{Resource: from}
+	case map[string]interface{}:
+		if res, ok := from["resource"].(string); ok {
+			m.From.Resource = res
+		}
+		if ws, ok := from["workspace"].(string); ok {
+			m.From.Workspace = ws
+		}
+		if m.From.Resource == "" {
+			return fmt.Errorf("invalid 'from' object: resource is required")
+		}
+	default:
+		return fmt.Errorf("invalid 'from' field: must be string or object with resource/workspace")
+	}
 
 	// Handle the `to` field - can be string or object
 	switch to := raw.To.(type) {
@@ -143,12 +168,22 @@ func (m *Move) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+// GetFromResource returns the source resource address.
+func (m *Move) GetFromResource() string {
+	return m.From.Resource
+}
+
+// GetFromWorkspace returns the source workspace (empty means auto-detect).
+func (m *Move) GetFromWorkspace() string {
+	return m.From.Workspace
+}
+
 // GetToResource returns the destination resource address.
 func (m *Move) GetToResource() string {
 	if m.To.Resource != "" {
 		return m.To.Resource
 	}
-	return m.From // Default to same address if not specified
+	return m.From.Resource // Default to same address if not specified
 }
 
 // GetToWorkspace returns the destination workspace.
@@ -274,7 +309,7 @@ func (m *Migration) Validate() error {
 	}
 
 	for i, mv := range m.Moves {
-		if mv.From == "" {
+		if mv.GetFromResource() == "" {
 			return fmt.Errorf("move[%d]: from is required", i)
 		}
 		// To can be empty if it's same as From (for workspace-only moves)
