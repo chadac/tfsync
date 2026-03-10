@@ -238,7 +238,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 				return fmt.Errorf("failed to resolve source path: %w", err)
 			}
 
-			if _, err := copier.CopyToLocal(ctx, absSrcDir, absTargetDir, srcWs.Backend); err != nil {
+			if _, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig()); err != nil {
 				rep.Error("Failed to copy state: %v", err)
 				return err
 			}
@@ -267,7 +267,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 
 			rep.Step("Copying state: %s -> %s", srcWs.Path, targetWs.Path)
 
-			if _, err := copier.CopyToLocal(ctx, absSrcDir, absTargetDir, srcWs.Backend); err != nil {
+			if _, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig()); err != nil {
 				rep.Error("Failed to copy state: %v", err)
 				return err
 			}
@@ -319,7 +319,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	var planResults []internal.PlanResult
 	for wsName, targetWs := range targetWorkspaces {
 		absTargetDir, _ := filepath.Abs(targetWs.Path)
-		cli := internal.NewCLI(binary, absTargetDir)
+		cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
 
 		if cfg.TF != nil {
 			cli.Parallelism = cfg.TF.Parallelism

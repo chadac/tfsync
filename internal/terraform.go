@@ -26,6 +26,8 @@ type CLI struct {
 	VarFiles []string
 	// Vars is a list of -var values
 	Vars []string
+	// PlanConfig holds plan-specific configuration
+	PlanConfig *PlanConfig
 }
 
 // NewCLI creates a new terraform CLI wrapper.
@@ -39,19 +41,40 @@ func NewCLI(binary, workDir string) *CLI {
 	}
 }
 
+// NewCLIWithConfig creates a new terraform CLI wrapper with plan configuration.
+func NewCLIWithConfig(binary, workDir string, planCfg *PlanConfig) *CLI {
+	cli := NewCLI(binary, workDir)
+	cli.PlanConfig = planCfg
+	return cli
+}
+
 // Init runs terraform init.
 func (c *CLI) Init(ctx context.Context) error {
-	args := []string{"init", "-input=false"}
-	_, err := c.run(ctx, args...)
-	return err
+	return c.InitWithConfig(ctx, nil)
 }
 
 // InitWithBackendConfig runs terraform init with backend config overrides.
+// Deprecated: use InitWithConfig instead.
 func (c *CLI) InitWithBackendConfig(ctx context.Context, backendConfig map[string]string) error {
-	args := []string{"init", "-input=false", "-reconfigure"}
-	for k, v := range backendConfig {
-		args = append(args, fmt.Sprintf("-backend-config=%s=%s", k, v))
+	return c.InitWithConfig(ctx, &InitConfig{Backend: backendConfig})
+}
+
+// InitWithConfig runs terraform init with the given configuration.
+func (c *CLI) InitWithConfig(ctx context.Context, cfg *InitConfig) error {
+	args := []string{"init", "-input=false"}
+
+	if cfg != nil {
+		// Add backend config overrides (with env var expansion)
+		if len(cfg.Backend) > 0 {
+			args = append(args, "-reconfigure")
+			for k, v := range ExpandEnvMap(cfg.Backend) {
+				args = append(args, fmt.Sprintf("-backend-config=%s=%s", k, v))
+			}
+		}
+		// Add extra args (with env var expansion)
+		args = append(args, ExpandEnvSlice(cfg.ExtraArgs)...)
 	}
+
 	_, err := c.run(ctx, args...)
 	return err
 }
@@ -155,6 +178,16 @@ func (c *CLI) planArgs(outPath string) []string {
 		args = append(args, "-out="+outPath)
 	}
 
+	// Apply PlanConfig settings
+	if c.PlanConfig != nil {
+		if c.PlanConfig.Lock != nil {
+			args = append(args, fmt.Sprintf("-lock=%t", *c.PlanConfig.Lock))
+		}
+		if c.PlanConfig.Refresh != nil {
+			args = append(args, fmt.Sprintf("-refresh=%t", *c.PlanConfig.Refresh))
+		}
+	}
+
 	if c.Parallelism > 0 {
 		args = append(args, fmt.Sprintf("-parallelism=%d", c.Parallelism))
 	}
@@ -165,6 +198,11 @@ func (c *CLI) planArgs(outPath string) []string {
 
 	for _, v := range c.Vars {
 		args = append(args, "-var="+v)
+	}
+
+	// Add extra args from PlanConfig (with env var expansion)
+	if c.PlanConfig != nil && len(c.PlanConfig.ExtraArgs) > 0 {
+		args = append(args, ExpandEnvSlice(c.PlanConfig.ExtraArgs)...)
 	}
 
 	return args

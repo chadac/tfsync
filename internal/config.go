@@ -21,7 +21,12 @@ type Config struct {
 // Source represents the source terraform configuration (where state comes from).
 type Source struct {
 	// Single workspace mode
-	Path    string            `yaml:"path,omitempty"`
+	Path string `yaml:"path,omitempty"`
+	// Init configuration (single workspace mode)
+	Init *InitConfig `yaml:"init,omitempty"`
+	// Plan configuration (single workspace mode)
+	Plan *PlanConfig `yaml:"plan,omitempty"`
+	// Deprecated: use Init.Backend instead
 	Backend map[string]string `yaml:"backend,omitempty"`
 
 	// Multi-workspace mode
@@ -31,16 +36,44 @@ type Source struct {
 // Target represents the target terraform configuration (where state goes).
 type Target struct {
 	// Single workspace mode
-	Path    string            `yaml:"path,omitempty"`
+	Path string `yaml:"path,omitempty"`
+	// Init configuration (single workspace mode)
+	Init *InitConfig `yaml:"init,omitempty"`
+	// Plan configuration (single workspace mode)
+	Plan *PlanConfig `yaml:"plan,omitempty"`
+	// Deprecated: use Init.Backend instead
 	Backend map[string]string `yaml:"backend,omitempty"`
 
 	// Multi-workspace mode
 	Workspaces map[string]Workspace `yaml:"workspaces,omitempty"`
 }
 
+// InitConfig holds configuration for terraform init.
+type InitConfig struct {
+	// Backend config overrides passed as -backend-config=key=value
+	Backend map[string]string `yaml:"backend,omitempty"`
+	// ExtraArgs are additional arguments passed to init
+	ExtraArgs []string `yaml:"extra_args,omitempty"`
+}
+
+// PlanConfig holds configuration for terraform plan.
+type PlanConfig struct {
+	// Lock controls state locking (-lock flag)
+	Lock *bool `yaml:"lock,omitempty"`
+	// Refresh controls state refresh (-refresh flag)
+	Refresh *bool `yaml:"refresh,omitempty"`
+	// ExtraArgs are additional arguments passed to plan
+	ExtraArgs []string `yaml:"extra_args,omitempty"`
+}
+
 // Workspace represents a single terraform workspace configuration.
 type Workspace struct {
-	Path    string            `yaml:"path"`
+	Path string `yaml:"path"`
+	// Init configuration
+	Init *InitConfig `yaml:"init,omitempty"`
+	// Plan configuration
+	Plan *PlanConfig `yaml:"plan,omitempty"`
+	// Deprecated: use Init.Backend instead
 	Backend map[string]string `yaml:"backend,omitempty"`
 }
 
@@ -266,7 +299,7 @@ func (s *Source) GetWorkspaces() map[string]Workspace {
 		return s.Workspaces
 	}
 	return map[string]Workspace{
-		"default": {Path: s.Path, Backend: s.Backend},
+		"default": {Path: s.Path, Init: s.Init, Plan: s.Plan, Backend: s.Backend},
 	}
 }
 
@@ -276,8 +309,32 @@ func (t *Target) GetWorkspaces() map[string]Workspace {
 		return t.Workspaces
 	}
 	return map[string]Workspace{
-		"default": {Path: t.Path, Backend: t.Backend},
+		"default": {Path: t.Path, Init: t.Init, Plan: t.Plan, Backend: t.Backend},
 	}
+}
+
+// GetInitConfig returns the effective init configuration for a workspace.
+// Merges deprecated Backend field into Init.Backend for backwards compatibility.
+func (w *Workspace) GetInitConfig() *InitConfig {
+	if w.Init != nil {
+		// If deprecated Backend is set but Init.Backend is not, merge it
+		if len(w.Backend) > 0 && len(w.Init.Backend) == 0 {
+			merged := *w.Init
+			merged.Backend = w.Backend
+			return &merged
+		}
+		return w.Init
+	}
+	// No Init config, but maybe deprecated Backend is set
+	if len(w.Backend) > 0 {
+		return &InitConfig{Backend: w.Backend}
+	}
+	return nil
+}
+
+// GetPlanConfig returns the plan configuration for a workspace.
+func (w *Workspace) GetPlanConfig() *PlanConfig {
+	return w.Plan
 }
 
 // GetTool returns the tf tool to use, defaulting to "tofu".
@@ -286,4 +343,34 @@ func (t *TF) GetTool() string {
 		return "tofu"
 	}
 	return t.Tool
+}
+
+// ExpandEnv expands environment variables in a string using ${VAR} syntax.
+// Falls back to empty string if the variable is not set.
+func ExpandEnv(s string) string {
+	return os.Expand(s, os.Getenv)
+}
+
+// ExpandEnvMap expands environment variables in all values of a map.
+func ExpandEnvMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	result := make(map[string]string, len(m))
+	for k, v := range m {
+		result[k] = ExpandEnv(v)
+	}
+	return result
+}
+
+// ExpandEnvSlice expands environment variables in all elements of a slice.
+func ExpandEnvSlice(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	result := make([]string, len(s))
+	for i, v := range s {
+		result[i] = ExpandEnv(v)
+	}
+	return result
 }

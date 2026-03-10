@@ -2,3 +2,5 @@ builds:
   include:
     - "packages.*.*"
     - "devShells.*.*"
+  branches:
+    - main

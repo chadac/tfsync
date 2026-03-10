@@ -30,17 +30,22 @@ type CopyResult struct {
 
 // CopyToLocal copies state from a source terraform config to a local state file.
 // This pulls from the source's configured backend and writes to a local file.
+// Deprecated: use CopyToLocalWithConfig instead.
 func (c *Copier) CopyToLocal(ctx context.Context, sourceDir, targetDir string, backendConfig map[string]string) (*CopyResult, error) {
+	var initCfg *InitConfig
+	if len(backendConfig) > 0 {
+		initCfg = &InitConfig{Backend: backendConfig}
+	}
+	return c.CopyToLocalWithConfig(ctx, sourceDir, targetDir, initCfg)
+}
+
+// CopyToLocalWithConfig copies state from a source terraform config to a local state file.
+// This pulls from the source's configured backend and writes to a local file.
+func (c *Copier) CopyToLocalWithConfig(ctx context.Context, sourceDir, targetDir string, initCfg *InitConfig) (*CopyResult, error) {
 	// Initialize source to connect to its backend
 	sourceCLI := NewCLI(c.binary, sourceDir)
-	if len(backendConfig) > 0 {
-		if err := sourceCLI.InitWithBackendConfig(ctx, backendConfig); err != nil {
-			return nil, fmt.Errorf("failed to init source: %w", err)
-		}
-	} else {
-		if err := sourceCLI.Init(ctx); err != nil {
-			return nil, fmt.Errorf("failed to init source: %w", err)
-		}
+	if err := sourceCLI.InitWithConfig(ctx, initCfg); err != nil {
+		return nil, fmt.Errorf("failed to init source: %w", err)
 	}
 
 	// Pull state from source
