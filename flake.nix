@@ -12,19 +12,7 @@
 
       perSystem = { config, self', inputs', pkgs, system, ... }: {
         packages = {
-          tfsync = pkgs.buildGoModule {
-            pname = "tfsync";
-            version = "0.1.0";
-            src = ./.;
-            vendorHash = "sha256-Y8z+13XK40p36EYg5Nam8Ds8EW/OIStbpawl2sqOhrY=";
-            subPackages = [ "cmd" ];
-            meta = with pkgs.lib; {
-              description = "Terraform State Migration Validator";
-              homepage = "https://github.com/chadac/tfsync";
-              license = licenses.mit;
-              maintainers = [ ];
-            };
-          };
+          tfsync = pkgs.callPackage ./default.nix {};
           default = self'.packages.tfsync;
         };
 
