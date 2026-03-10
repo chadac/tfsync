@@ -1,0 +1,433 @@
+package internal
+
+import (
+	"os"
+	"testing"
+)
+
+func TestExpandEnv(t *testing.T) {
+	// Set up test environment variables
+	os.Setenv("TEST_VAR", "test_value")
+	os.Setenv("TEST_USER", "myuser")
+	defer func() {
+		os.Unsetenv("TEST_VAR")
+		os.Unsetenv("TEST_USER")
+	}()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "simple variable",
+			input:    "${TEST_VAR}",
+			expected: "test_value",
+		},
+		{
+			name:     "variable in string",
+			input:    "prefix_${TEST_VAR}_suffix",
+			expected: "prefix_test_value_suffix",
+		},
+		{
+			name:     "multiple variables",
+			input:    "${TEST_USER}:${TEST_VAR}",
+			expected: "myuser:test_value",
+		},
+		{
+			name:     "unset variable",
+			input:    "${UNSET_VAR}",
+			expected: "",
+		},
+		{
+			name:     "no variables",
+			input:    "plain string",
+			expected: "plain string",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ExpandEnv(tt.input)
+			if result != tt.expected {
+				t.Errorf("ExpandEnv(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExpandEnvMap(t *testing.T) {
+	os.Setenv("TEST_TOKEN", "secret123")
+	defer os.Unsetenv("TEST_TOKEN")
+
+	tests := []struct {
+		name     string
+		input    map[string]string
+		expected map[string]string
+	}{
+		{
+			name:     "nil map",
+			input:    nil,
+			expected: nil,
+		},
+		{
+			name:     "empty map",
+			input:    map[string]string{},
+			expected: map[string]string{},
+		},
+		{
+			name: "map with variables",
+			input: map[string]string{
+				"password": "${TEST_TOKEN}",
+				"username": "static_user",
+			},
+			expected: map[string]string{
+				"password": "secret123",
+				"username": "static_user",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ExpandEnvMap(tt.input)
+			if tt.expected == nil {
+				if result != nil {
+					t.Errorf("ExpandEnvMap(nil) = %v, want nil", result)
+				}
+				return
+			}
+			if len(result) != len(tt.expected) {
+				t.Errorf("ExpandEnvMap() returned %d items, want %d", len(result), len(tt.expected))
+			}
+			for k, v := range tt.expected {
+				if result[k] != v {
+					t.Errorf("ExpandEnvMap()[%q] = %q, want %q", k, result[k], v)
+				}
+			}
+		})
+	}
+}
+
+func TestExpandEnvSlice(t *testing.T) {
+	os.Setenv("TEST_FLAG", "value1")
+	defer os.Unsetenv("TEST_FLAG")
+
+	tests := []struct {
+		name     string
+		input    []string
+		expected []string
+	}{
+		{
+			name:     "nil slice",
+			input:    nil,
+			expected: nil,
+		},
+		{
+			name:     "empty slice",
+			input:    []string{},
+			expected: []string{},
+		},
+		{
+			name:     "slice with variables",
+			input:    []string{"-var=${TEST_FLAG}", "-static"},
+			expected: []string{"-var=value1", "-static"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ExpandEnvSlice(tt.input)
+			if tt.expected == nil {
+				if result != nil {
+					t.Errorf("ExpandEnvSlice(nil) = %v, want nil", result)
+				}
+				return
+			}
+			if len(result) != len(tt.expected) {
+				t.Errorf("ExpandEnvSlice() returned %d items, want %d", len(result), len(tt.expected))
+			}
+			for i, v := range tt.expected {
+				if result[i] != v {
+					t.Errorf("ExpandEnvSlice()[%d] = %q, want %q", i, result[i], v)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkspaceGetInitConfig(t *testing.T) {
+	tests := []struct {
+		name            string
+		workspace       Workspace
+		expectNil       bool
+		expectedBackend map[string]string
+	}{
+		{
+			name:      "no init config, no backend",
+			workspace: Workspace{Path: "/test"},
+			expectNil: true,
+		},
+		{
+			name: "deprecated backend only",
+			workspace: Workspace{
+				Path:    "/test",
+				Backend: map[string]string{"key": "value"},
+			},
+			expectNil:       false,
+			expectedBackend: map[string]string{"key": "value"},
+		},
+		{
+			name: "init config only",
+			workspace: Workspace{
+				Path: "/test",
+				Init: &InitConfig{
+					Backend: map[string]string{"address": "http://example.com"},
+				},
+			},
+			expectNil:       false,
+			expectedBackend: map[string]string{"address": "http://example.com"},
+		},
+		{
+			name: "init config with deprecated backend (init takes precedence)",
+			workspace: Workspace{
+				Path: "/test",
+				Init: &InitConfig{
+					Backend: map[string]string{"address": "http://init.com"},
+				},
+				Backend: map[string]string{"address": "http://deprecated.com"},
+			},
+			expectNil:       false,
+			expectedBackend: map[string]string{"address": "http://init.com"},
+		},
+		{
+			name: "init config without backend, deprecated backend set (merge)",
+			workspace: Workspace{
+				Path: "/test",
+				Init: &InitConfig{
+					ExtraArgs: []string{"-upgrade"},
+				},
+				Backend: map[string]string{"address": "http://deprecated.com"},
+			},
+			expectNil:       false,
+			expectedBackend: map[string]string{"address": "http://deprecated.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.workspace.GetInitConfig()
+			if tt.expectNil {
+				if result != nil {
+					t.Errorf("GetInitConfig() = %v, want nil", result)
+				}
+				return
+			}
+			if result == nil {
+				t.Errorf("GetInitConfig() = nil, want non-nil")
+				return
+			}
+			if len(result.Backend) != len(tt.expectedBackend) {
+				t.Errorf("GetInitConfig().Backend has %d items, want %d", len(result.Backend), len(tt.expectedBackend))
+			}
+			for k, v := range tt.expectedBackend {
+				if result.Backend[k] != v {
+					t.Errorf("GetInitConfig().Backend[%q] = %q, want %q", k, result.Backend[k], v)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkspaceGetPlanConfig(t *testing.T) {
+	lockFalse := false
+	refreshTrue := true
+
+	tests := []struct {
+		name      string
+		workspace Workspace
+		expectNil bool
+		checkLock *bool
+	}{
+		{
+			name:      "no plan config",
+			workspace: Workspace{Path: "/test"},
+			expectNil: true,
+		},
+		{
+			name: "with plan config",
+			workspace: Workspace{
+				Path: "/test",
+				Plan: &PlanConfig{
+					Lock:    &lockFalse,
+					Refresh: &refreshTrue,
+				},
+			},
+			expectNil: false,
+			checkLock: &lockFalse,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.workspace.GetPlanConfig()
+			if tt.expectNil {
+				if result != nil {
+					t.Errorf("GetPlanConfig() = %v, want nil", result)
+				}
+				return
+			}
+			if result == nil {
+				t.Errorf("GetPlanConfig() = nil, want non-nil")
+				return
+			}
+			if tt.checkLock != nil && (result.Lock == nil || *result.Lock != *tt.checkLock) {
+				t.Errorf("GetPlanConfig().Lock = %v, want %v", result.Lock, *tt.checkLock)
+			}
+		})
+	}
+}
+
+func TestSourceGetWorkspaces(t *testing.T) {
+	lockFalse := false
+
+	tests := []struct {
+		name           string
+		source         Source
+		expectedCount  int
+		checkDefault   bool
+		defaultPath    string
+		defaultHasInit bool
+		defaultHasPlan bool
+	}{
+		{
+			name: "single workspace mode",
+			source: Source{
+				Path: "/single",
+				Init: &InitConfig{Backend: map[string]string{"key": "value"}},
+				Plan: &PlanConfig{Lock: &lockFalse},
+			},
+			expectedCount:  1,
+			checkDefault:   true,
+			defaultPath:    "/single",
+			defaultHasInit: true,
+			defaultHasPlan: true,
+		},
+		{
+			name: "multi workspace mode",
+			source: Source{
+				Workspaces: map[string]Workspace{
+					"dev":  {Path: "/dev"},
+					"prod": {Path: "/prod"},
+				},
+			},
+			expectedCount: 2,
+			checkDefault:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.source.GetWorkspaces()
+			if len(result) != tt.expectedCount {
+				t.Errorf("GetWorkspaces() returned %d workspaces, want %d", len(result), tt.expectedCount)
+			}
+			if tt.checkDefault {
+				ws, ok := result["default"]
+				if !ok {
+					t.Errorf("GetWorkspaces() missing 'default' workspace")
+					return
+				}
+				if ws.Path != tt.defaultPath {
+					t.Errorf("default workspace Path = %q, want %q", ws.Path, tt.defaultPath)
+				}
+				if tt.defaultHasInit && ws.Init == nil {
+					t.Errorf("default workspace Init = nil, want non-nil")
+				}
+				if tt.defaultHasPlan && ws.Plan == nil {
+					t.Errorf("default workspace Plan = nil, want non-nil")
+				}
+			}
+		})
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      Config
+		expectError bool
+	}{
+		{
+			name: "valid config",
+			config: Config{
+				Version: "1",
+				Source:  Source{Path: "/source"},
+				Target:  Target{Path: "/target"},
+				Migration: Migration{
+					Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "missing version",
+			config: Config{
+				Source:    Source{Path: "/source"},
+				Target:    Target{Path: "/target"},
+				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+			},
+			expectError: true,
+		},
+		{
+			name: "invalid version",
+			config: Config{
+				Version:   "2",
+				Source:    Source{Path: "/source"},
+				Target:    Target{Path: "/target"},
+				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+			},
+			expectError: true,
+		},
+		{
+			name: "missing source path",
+			config: Config{
+				Version:   "1",
+				Source:    Source{},
+				Target:    Target{Path: "/target"},
+				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+			},
+			expectError: true,
+		},
+		{
+			name: "both path and workspaces",
+			config: Config{
+				Version: "1",
+				Source: Source{
+					Path:       "/source",
+					Workspaces: map[string]Workspace{"dev": {Path: "/dev"}},
+				},
+				Target:    Target{Path: "/target"},
+				Migration: Migration{Moves: []Move{{From: "a.b", To: MoveTo{Resource: "c.d"}}}},
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.expectError && err == nil {
+				t.Errorf("Validate() = nil, want error")
+			}
+			if !tt.expectError && err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
