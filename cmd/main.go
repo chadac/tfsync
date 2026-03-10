@@ -11,12 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/chadac/tfsync/internal/config"
-	"github.com/chadac/tfsync/internal/migration"
-	"github.com/chadac/tfsync/internal/reporter"
-	"github.com/chadac/tfsync/internal/state"
-	"github.com/chadac/tfsync/internal/suggest"
-	"github.com/chadac/tfsync/internal/terraform"
+	"github.com/chadac/tfsync/internal"
 )
 
 var (
@@ -70,7 +65,7 @@ func runAutosuggest(cmd *cobra.Command, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	rep := reporter.New(verbose)
+	rep := internal.NewReporter(verbose)
 
 	// Load config (we need source/target paths, migration section is optional for autosuggest)
 	rep.Step("Loading configuration from %s", configFile)
@@ -83,7 +78,7 @@ func runAutosuggest(cmd *cobra.Command, args []string) error {
 	binary := cfg.TF.GetTool()
 	rep.Info("Using tf tool: %s", binary)
 
-	suggester := suggest.NewSuggester(binary)
+	suggester := internal.NewSuggester(binary)
 
 	rep.Step("Analyzing source and target resources...")
 	result, err := suggester.Suggest(ctx, cfg)
@@ -134,13 +129,13 @@ func runAutosuggest(cmd *cobra.Command, args []string) error {
 }
 
 // loadConfigForAutosuggest loads config but doesn't require migration section.
-func loadConfigForAutosuggest(path string) (*config.Config, error) {
+func loadConfigForAutosuggest(path string) (*internal.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	var cfg config.Config
+	var cfg internal.Config
 	if err := parseYAML(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -163,20 +158,20 @@ func loadConfigForAutosuggest(path string) (*config.Config, error) {
 }
 
 // parseYAML is a helper to parse YAML without strict validation.
-func parseYAML(data []byte, cfg *config.Config) error {
+func parseYAML(data []byte, cfg *internal.Config) error {
 	// We need to import yaml - let's use a simple approach
-	return config.ParseYAMLRaw(data, cfg)
+	return internal.ParseYAMLRaw(data, cfg)
 }
 
 func runSync(cmd *cobra.Command, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	rep := reporter.New(verbose)
+	rep := internal.NewReporter(verbose)
 
 	// Load config
 	rep.Step("Loading configuration from %s", configFile)
-	cfg, err := config.Load(configFile)
+	cfg, err := internal.Load(configFile)
 	if err != nil {
 		rep.Error("Failed to load config: %v", err)
 		return err
@@ -187,7 +182,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Dry run mode
 	if dryRun {
-		executor := migration.NewExecutor(binary)
+		executor := internal.NewExecutor(binary)
 		actions := executor.DryRun(&cfg.Migration)
 		rep.DryRunActions(actions)
 		return nil
@@ -197,10 +192,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	return runSyncWorkflow(ctx, cfg, rep)
 }
 
-func runSyncWorkflow(ctx context.Context, cfg *config.Config, rep *reporter.Reporter) error {
+func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Reporter) error {
 	binary := cfg.TF.GetTool()
-	copier := state.NewCopier(binary)
-	executor := migration.NewExecutor(binary)
+	copier := internal.NewCopier(binary)
+	executor := internal.NewExecutor(binary)
 
 	sourceWorkspaces := cfg.Source.GetWorkspaces()
 	targetWorkspaces := cfg.Target.GetWorkspaces()
@@ -289,7 +284,7 @@ func runSyncWorkflow(ctx context.Context, cfg *config.Config, rep *reporter.Repo
 	// Execute migrations
 	rep.Header("Running Migrations")
 
-	var migrationResult *migration.Result
+	var migrationResult *internal.Result
 	if cfg.Target.IsMultiWorkspace() {
 		targetDirMap := make(map[string]string)
 		for wsName, ws := range targetWorkspaces {
@@ -321,10 +316,10 @@ func runSyncWorkflow(ctx context.Context, cfg *config.Config, rep *reporter.Repo
 	// Run plans
 	rep.Header("Validating Plans")
 
-	var planResults []reporter.PlanResult
+	var planResults []internal.PlanResult
 	for wsName, targetWs := range targetWorkspaces {
 		absTargetDir, _ := filepath.Abs(targetWs.Path)
-		cli := terraform.NewCLI(binary, absTargetDir)
+		cli := internal.NewCLI(binary, absTargetDir)
 
 		if cfg.TF != nil {
 			cli.Parallelism = cfg.TF.Parallelism
@@ -335,7 +330,7 @@ func runSyncWorkflow(ctx context.Context, cfg *config.Config, rep *reporter.Repo
 		rep.Step("Running plan for %s", wsName)
 		hasChanges, output, err := cli.PlanHasChanges(ctx)
 
-		planResults = append(planResults, reporter.PlanResult{
+		planResults = append(planResults, internal.PlanResult{
 			Workspace:  wsName,
 			HasChanges: hasChanges,
 			Output:     output,
@@ -348,7 +343,7 @@ func runSyncWorkflow(ctx context.Context, cfg *config.Config, rep *reporter.Repo
 	allPassed := rep.ReportPlanResults(planResults)
 
 	// Summary
-	rep.ReportSummary(reporter.SummaryResult{
+	rep.ReportSummary(internal.SummaryResult{
 		SourceWorkspaces: len(sourceWorkspaces),
 		TargetWorkspaces: len(targetWorkspaces),
 		MovesExecuted:    migrationResult.MovesExecuted,

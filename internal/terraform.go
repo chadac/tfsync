@@ -1,5 +1,4 @@
-// Package terraform provides a wrapper around the terraform/tofu CLI.
-package terraform
+package internal
 
 import (
 	"bytes"

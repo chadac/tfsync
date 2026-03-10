@@ -1,13 +1,10 @@
-// Package state handles terraform state operations (copy, backup, restore).
-package state
+package internal
 
 import (
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/chadac/tfsync/internal/terraform"
 )
 
 // Copier handles copying state between terraform configurations.
@@ -35,7 +32,7 @@ type CopyResult struct {
 // This pulls from the source's configured backend and writes to a local file.
 func (c *Copier) CopyToLocal(ctx context.Context, sourceDir, targetDir string, backendConfig map[string]string) (*CopyResult, error) {
 	// Initialize source to connect to its backend
-	sourceCLI := terraform.NewCLI(c.binary, sourceDir)
+	sourceCLI := NewCLI(c.binary, sourceDir)
 	if len(backendConfig) > 0 {
 		if err := sourceCLI.InitWithBackendConfig(ctx, backendConfig); err != nil {
 			return nil, fmt.Errorf("failed to init source: %w", err)
@@ -88,7 +85,7 @@ terraform {
 	}
 
 	// Initialize target with local backend
-	targetCLI := terraform.NewCLI(c.binary, targetDir)
+	targetCLI := NewCLI(c.binary, targetDir)
 	if err := targetCLI.Init(ctx); err != nil {
 		return fmt.Errorf("failed to init target: %w", err)
 	}

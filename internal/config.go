@@ -1,5 +1,5 @@
-// Package config handles parsing and validation of tfsync configuration files.
-package config
+// Package internal contains the core tfsync implementation.
+package internal
 
 import (
 	"fmt"

@@ -1,14 +1,10 @@
-// Package migration handles executing state migrations (moves and scripts).
-package migration
+package internal
 
 import (
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
-
-	"github.com/chadac/tfsync/internal/config"
-	"github.com/chadac/tfsync/internal/terraform"
 )
 
 // Executor runs state migrations.
@@ -35,7 +31,7 @@ type Result struct {
 }
 
 // Execute runs the configured migrations on the target state.
-func (e *Executor) Execute(ctx context.Context, cfg *config.Migration, targetDir string) (*Result, error) {
+func (e *Executor) Execute(ctx context.Context, cfg *Migration, targetDir string) (*Result, error) {
 	result := &Result{}
 
 	// Run inline moves first
@@ -58,8 +54,8 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Migration, targetDir
 }
 
 // executeMoves runs terraform state mv for each configured move.
-func (e *Executor) executeMoves(ctx context.Context, moves []config.Move, targetDir string) error {
-	cli := terraform.NewCLI(e.binary, targetDir)
+func (e *Executor) executeMoves(ctx context.Context, moves []Move, targetDir string) error {
+	cli := NewCLI(e.binary, targetDir)
 
 	for i, mv := range moves {
 		toResource := mv.GetToResource()
@@ -97,13 +93,13 @@ func (e *Executor) executeScript(ctx context.Context, script, targetDir string) 
 // 3. Performs any actual moves (where from != to address)
 func (e *Executor) ExecuteMultiWorkspace(
 	ctx context.Context,
-	cfg *config.Migration,
+	cfg *Migration,
 	targetWorkspaces map[string]string, // workspace name -> directory
 ) (*Result, error) {
 	result := &Result{}
 
 	// Group moves by target workspace
-	movesByWorkspace := make(map[string][]config.Move)
+	movesByWorkspace := make(map[string][]Move)
 	allSourceAddrs := make(map[string]string) // from addr -> target workspace
 
 	for _, mv := range cfg.Moves {
@@ -119,7 +115,7 @@ func (e *Executor) ExecuteMultiWorkspace(
 	// 1. Remove resources that belong to OTHER workspaces
 	// 2. Execute moves where from != to
 	for wsName, targetDir := range targetWorkspaces {
-		cli := terraform.NewCLI(e.binary, targetDir)
+		cli := NewCLI(e.binary, targetDir)
 
 		// Get current resources in this workspace's state
 		currentResources, err := cli.StateList(ctx)
@@ -169,7 +165,7 @@ func (e *Executor) ExecuteMultiWorkspace(
 }
 
 // DryRun shows what migrations would be executed without running them.
-func (e *Executor) DryRun(cfg *config.Migration) []string {
+func (e *Executor) DryRun(cfg *Migration) []string {
 	var actions []string
 
 	for _, mv := range cfg.Moves {

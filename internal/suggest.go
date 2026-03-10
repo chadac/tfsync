@@ -1,5 +1,4 @@
-// Package suggest provides auto-suggestion of state migrations based on resource similarity.
-package suggest
+package internal
 
 import (
 	"context"
@@ -8,9 +7,6 @@ import (
 	"strings"
 
 	tfjson "github.com/hashicorp/terraform-json"
-
-	"github.com/chadac/tfsync/internal/config"
-	"github.com/chadac/tfsync/internal/terraform"
 )
 
 // Suggester generates migration suggestions.
@@ -35,8 +31,8 @@ type Suggestion struct {
 	Reason          string
 }
 
-// Result contains the suggestion results.
-type Result struct {
+// SuggestResult contains the suggestion results.
+type SuggestResult struct {
 	Suggestions []Suggestion
 	// Unmapped resources in source that couldn't be matched
 	UnmappedSource []string
@@ -45,8 +41,8 @@ type Result struct {
 }
 
 // Suggest generates migration suggestions by comparing source and target resources.
-func (s *Suggester) Suggest(ctx context.Context, cfg *config.Config) (*Result, error) {
-	result := &Result{}
+func (s *Suggester) Suggest(ctx context.Context, cfg *Config) (*SuggestResult, error) {
+	result := &SuggestResult{}
 
 	// Get source resources
 	sourceResources, err := s.getResources(ctx, cfg.Source.GetWorkspaces())
@@ -183,11 +179,11 @@ type resourceInfo struct {
 }
 
 // getResources gets resources from terraform state.
-func (s *Suggester) getResources(ctx context.Context, workspaces map[string]config.Workspace) (map[string]resourceInfo, error) {
+func (s *Suggester) getResources(ctx context.Context, workspaces map[string]Workspace) (map[string]resourceInfo, error) {
 	resources := make(map[string]resourceInfo)
 
 	for wsName, ws := range workspaces {
-		cli := terraform.NewCLI(s.binary, ws.Path)
+		cli := NewCLI(s.binary, ws.Path)
 		if err := cli.Init(ctx); err != nil {
 			return nil, fmt.Errorf("workspace %s: %w", wsName, err)
 		}
@@ -209,11 +205,11 @@ func (s *Suggester) getResources(ctx context.Context, workspaces map[string]conf
 }
 
 // getPlannedResources gets resources from terraform plan (what the config defines).
-func (s *Suggester) getPlannedResources(ctx context.Context, workspaces map[string]config.Workspace) (map[string]resourceInfo, error) {
+func (s *Suggester) getPlannedResources(ctx context.Context, workspaces map[string]Workspace) (map[string]resourceInfo, error) {
 	resources := make(map[string]resourceInfo)
 
 	for wsName, ws := range workspaces {
-		cli := terraform.NewCLI(s.binary, ws.Path)
+		cli := NewCLI(s.binary, ws.Path)
 		if err := cli.Init(ctx); err != nil {
 			return nil, fmt.Errorf("workspace %s: %w", wsName, err)
 		}
@@ -363,7 +359,7 @@ func min(a, b, c int) int {
 }
 
 // GenerateYAML generates YAML configuration from suggestions.
-func (r *Result) GenerateYAML() string {
+func (r *SuggestResult) GenerateYAML() string {
 	var sb strings.Builder
 
 	sb.WriteString("migration:\n")

@@ -1,5 +1,4 @@
-// Package reporter handles output formatting for tfsync results.
-package reporter
+package internal
 
 import (
 	"fmt"
@@ -15,8 +14,8 @@ type Reporter struct {
 	verbose bool
 }
 
-// New creates a new reporter.
-func New(verbose bool) *Reporter {
+// NewReporter creates a new reporter.
+func NewReporter(verbose bool) *Reporter {
 	return &Reporter{
 		out:     os.Stdout,
 		verbose: verbose,

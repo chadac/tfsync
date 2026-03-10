@@ -17,7 +17,7 @@
             version = "0.1.0";
             src = ./.;
             vendorHash = "sha256-Y8z+13XK40p36EYg5Nam8Ds8EW/OIStbpawl2sqOhrY=";
-            subPackages = [ "cmd/tfsync" ];
+            subPackages = [ "cmd" ];
             meta = with pkgs.lib; {
               description = "Terraform State Migration Validator";
               homepage = "https://github.com/chadac/tfsync";
