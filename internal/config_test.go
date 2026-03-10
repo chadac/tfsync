@@ -565,3 +565,45 @@ func TestMoveGetToResourceDefault(t *testing.T) {
 		t.Errorf("GetToResource() = %q, want %q", got, "module.foo")
 	}
 }
+
+func TestWorkspaceSourceWorkspace(t *testing.T) {
+	// Test that source_workspace field is properly parsed from YAML
+	yamlData := `
+path: /target/dev-core
+source_workspace: development
+init:
+  backend:
+    key: dev-core
+`
+	var ws Workspace
+	err := yaml.Unmarshal([]byte(yamlData), &ws)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if ws.Path != "/target/dev-core" {
+		t.Errorf("Path = %q, want %q", ws.Path, "/target/dev-core")
+	}
+	if ws.SourceWorkspace != "development" {
+		t.Errorf("SourceWorkspace = %q, want %q", ws.SourceWorkspace, "development")
+	}
+	if ws.Init == nil || ws.Init.Backend["key"] != "dev-core" {
+		t.Errorf("Init.Backend not parsed correctly")
+	}
+}
+
+func TestWorkspaceSourceWorkspaceEmpty(t *testing.T) {
+	// Test that source_workspace defaults to empty when not specified
+	yamlData := `
+path: /target/dev
+`
+	var ws Workspace
+	err := yaml.Unmarshal([]byte(yamlData), &ws)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if ws.SourceWorkspace != "" {
+		t.Errorf("SourceWorkspace = %q, want empty string", ws.SourceWorkspace)
+	}
+}

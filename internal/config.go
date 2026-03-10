@@ -75,6 +75,9 @@ type Workspace struct {
 	Plan *PlanConfig `yaml:"plan,omitempty"`
 	// Deprecated: use Init.Backend instead
 	Backend map[string]string `yaml:"backend,omitempty"`
+	// SourceWorkspace specifies which source workspace this target pulls from.
+	// Only used for target workspaces. If empty, defaults to matching by name.
+	SourceWorkspace string `yaml:"source_workspace,omitempty"`
 }
 
 // Migration defines how state should be transformed.

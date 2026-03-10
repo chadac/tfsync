@@ -220,44 +220,57 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	sourceResources := make(internal.SourceWorkspaceResources)
 
 	if cfg.Source.IsMultiWorkspace() {
-		// Multi-source: each source workspace maps to a target workspace
-		for wsName, srcWs := range sourceWorkspaces {
-			targetWs, ok := targetWorkspaces[wsName]
+		// Multi-source: build reverse map from source workspace -> target workspaces
+		// This allows multiple targets to pull from the same source workspace
+		sourceToTargets := make(map[string][]string)
+		for tgtName, tgtWs := range targetWorkspaces {
+			srcName := tgtWs.SourceWorkspace
+			if srcName == "" {
+				srcName = tgtName // fallback to name match
+			}
+			sourceToTargets[srcName] = append(sourceToTargets[srcName], tgtName)
+		}
+
+		for srcName, srcWs := range sourceWorkspaces {
+			tgtNames, ok := sourceToTargets[srcName]
 			if !ok {
-				rep.Warning("Source workspace %q has no corresponding target, skipping", wsName)
+				rep.Warning("Source workspace %q has no corresponding targets, skipping", srcName)
 				continue
 			}
-
-			absTargetDir, err := filepath.Abs(targetWs.Path)
-			if err != nil {
-				return fmt.Errorf("failed to resolve target path: %w", err)
-			}
-			targetDirs = append(targetDirs, absTargetDir)
-
-			rep.Step("Copying state: %s -> %s", srcWs.Path, targetWs.Path)
 
 			absSrcDir, err := filepath.Abs(srcWs.Path)
 			if err != nil {
 				return fmt.Errorf("failed to resolve source path: %w", err)
 			}
 
-			copyResult, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig())
-			if err != nil {
-				rep.Error("Failed to copy state: %v", err)
-				return err
-			}
+			for _, tgtName := range tgtNames {
+				tgtWs := targetWorkspaces[tgtName]
+				absTargetDir, err := filepath.Abs(tgtWs.Path)
+				if err != nil {
+					return fmt.Errorf("failed to resolve target path: %w", err)
+				}
+				targetDirs = append(targetDirs, absTargetDir)
 
-			// Collect source resources for this workspace
-			if copyResult.SourceResources != nil {
-				sourceResources[wsName] = copyResult.SourceResources
-			}
+				rep.Step("Copying state: %s -> %s", srcWs.Path, tgtWs.Path)
 
-			if err := copier.InitTargetWithLocalBackend(ctx, absTargetDir); err != nil {
-				rep.Error("Failed to init target: %v", err)
-				return err
-			}
+				copyResult, err := copier.CopyToLocalWithConfig(ctx, absSrcDir, absTargetDir, srcWs.GetInitConfig())
+				if err != nil {
+					rep.Error("Failed to copy state: %v", err)
+					return err
+				}
 
-			rep.Success("State copied for workspace %s", wsName)
+				// Collect source resources for this workspace
+				if copyResult.SourceResources != nil {
+					sourceResources[srcName] = copyResult.SourceResources
+				}
+
+				if err := copier.InitTargetWithLocalBackend(ctx, absTargetDir); err != nil {
+					rep.Error("Failed to init target: %v", err)
+					return err
+				}
+
+				rep.Success("State copied: %s -> %s", srcName, tgtName)
+			}
 		}
 	} else {
 		// Single source: copy to all targets
