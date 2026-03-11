@@ -64,6 +64,13 @@ type PlanConfig struct {
 	Refresh *bool `yaml:"refresh,omitempty"`
 	// ExtraArgs are additional arguments passed to plan
 	ExtraArgs []string `yaml:"extra_args,omitempty"`
+	// OverrideFiles are terraform override files to write before running plan.
+	// Map of filename -> content. Files are written to the target directory.
+	// Example: {"provider_override.tf": "provider \"aws\" { ... }"}
+	OverrideFiles map[string]string `yaml:"override_files,omitempty"`
+	// IgnoreChanges is a list of resource addresses whose plan changes should be ignored.
+	// If a plan has changes but all changed resources are in this list, the plan is considered passing.
+	IgnoreChanges []string `yaml:"ignore_changes,omitempty"`
 }
 
 // Workspace represents a single terraform workspace configuration.
@@ -75,9 +82,13 @@ type Workspace struct {
 	Plan *PlanConfig `yaml:"plan,omitempty"`
 	// Deprecated: use Init.Backend instead
 	Backend map[string]string `yaml:"backend,omitempty"`
-	// SourceWorkspace specifies which source workspace this target pulls from.
+	// PreferWorkspace specifies which source workspace this target prefers to pull from.
 	// Only used for target workspaces. If empty, defaults to matching by name.
-	SourceWorkspace string `yaml:"source_workspace,omitempty"`
+	PreferWorkspace string `yaml:"prefer_workspace,omitempty"`
+	// ProviderRemap maps provider short names from source to target for this workspace.
+	// Takes precedence over Migration-level ProviderRemap.
+	// Example: {"aws.ireland": "aws"} remaps provider alias "ireland" to the default provider.
+	ProviderRemap map[string]string `yaml:"provider_remap,omitempty"`
 }
 
 // Migration defines how state should be transformed.
@@ -87,6 +98,11 @@ type Migration struct {
 
 	// Moves is a list of state move operations
 	Moves []Move `yaml:"moves,omitempty"`
+
+	// ProviderRemap maps provider short names from source to target.
+	// Applied globally to all moves. Per-move ProviderRemap takes precedence.
+	// Example: {"aws.ireland": "aws"} remaps provider alias "ireland" to the default provider.
+	ProviderRemap map[string]string `yaml:"provider_remap,omitempty"`
 }
 
 // Move represents a single terraform state mv operation.
@@ -101,6 +117,11 @@ type Move struct {
 	To   MoveTo   `yaml:"-"` // Custom unmarshaling
 	// TargetWorkspace is deprecated, use To.Workspace instead
 	TargetWorkspace string `yaml:"target_workspace,omitempty"`
+	// ProviderRemap maps provider short names for this specific move.
+	// Takes precedence over Migration-level ProviderRemap.
+	ProviderRemap map[string]string `yaml:"-"` // Custom unmarshaling
+	// Line is the YAML source line number (1-indexed, 0 means unknown)
+	Line int `yaml:"-"`
 }
 
 // MoveFrom represents the source of a state move.
@@ -119,9 +140,10 @@ type MoveTo struct {
 func (m *Move) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// First unmarshal into a temporary struct
 	type rawMove struct {
-		From            interface{} `yaml:"from"`
-		To              interface{} `yaml:"to"`
-		TargetWorkspace string      `yaml:"target_workspace,omitempty"`
+		From            interface{}       `yaml:"from"`
+		To              interface{}       `yaml:"to"`
+		TargetWorkspace string            `yaml:"target_workspace,omitempty"`
+		ProviderRemap   map[string]string `yaml:"provider_remap,omitempty"`
 	}
 	var raw rawMove
 	if err := unmarshal(&raw); err != nil {
@@ -129,6 +151,7 @@ func (m *Move) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 
 	m.TargetWorkspace = raw.TargetWorkspace
+	m.ProviderRemap = raw.ProviderRemap
 
 	// Handle the `from` field - can be string or object
 	switch from := raw.From.(type) {
@@ -223,6 +246,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Extract YAML line numbers for moves via yaml.Node tree
+	extractMoveLineNumbers(data, &cfg)
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
@@ -236,6 +262,54 @@ func ParseYAMLRaw(data []byte, cfg *Config) error {
 	return yaml.Unmarshal(data, cfg)
 }
 
+// extractMoveLineNumbers walks the yaml.Node tree to find line numbers for each move entry
+// and populates Move.Line fields on the already-parsed config.
+func extractMoveLineNumbers(data []byte, cfg *Config) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return // Best-effort; line numbers are optional
+	}
+
+	// root is a Document node, its first child is the top-level mapping
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return
+	}
+	topMap := root.Content[0]
+	if topMap.Kind != yaml.MappingNode {
+		return
+	}
+
+	// Find "migration" key in top-level mapping
+	var migrationNode *yaml.Node
+	for i := 0; i+1 < len(topMap.Content); i += 2 {
+		if topMap.Content[i].Value == "migration" {
+			migrationNode = topMap.Content[i+1]
+			break
+		}
+	}
+	if migrationNode == nil || migrationNode.Kind != yaml.MappingNode {
+		return
+	}
+
+	// Find "moves" key in migration mapping
+	var movesNode *yaml.Node
+	for i := 0; i+1 < len(migrationNode.Content); i += 2 {
+		if migrationNode.Content[i].Value == "moves" {
+			movesNode = migrationNode.Content[i+1]
+			break
+		}
+	}
+	if movesNode == nil || movesNode.Kind != yaml.SequenceNode {
+		return
+	}
+
+	// Each child of the sequence node is a move entry
+	for i, moveNode := range movesNode.Content {
+		if i < len(cfg.Migration.Moves) {
+			cfg.Migration.Moves[i].Line = moveNode.Line
+		}
+	}
+}
 // Validate checks that the configuration is valid.
 func (c *Config) Validate() error {
 	if c.Version == "" {

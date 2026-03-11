@@ -2,6 +2,7 @@ package internal
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -566,11 +567,11 @@ func TestMoveGetToResourceDefault(t *testing.T) {
 	}
 }
 
-func TestWorkspaceSourceWorkspace(t *testing.T) {
-	// Test that source_workspace field is properly parsed from YAML
+func TestWorkspacePreferWorkspace(t *testing.T) {
+	// Test that prefer_workspace field is properly parsed from YAML
 	yamlData := `
 path: /target/dev-core
-source_workspace: development
+prefer_workspace: development
 init:
   backend:
     key: dev-core
@@ -584,16 +585,16 @@ init:
 	if ws.Path != "/target/dev-core" {
 		t.Errorf("Path = %q, want %q", ws.Path, "/target/dev-core")
 	}
-	if ws.SourceWorkspace != "development" {
-		t.Errorf("SourceWorkspace = %q, want %q", ws.SourceWorkspace, "development")
+	if ws.PreferWorkspace != "development" {
+		t.Errorf("PreferWorkspace = %q, want %q", ws.PreferWorkspace, "development")
 	}
 	if ws.Init == nil || ws.Init.Backend["key"] != "dev-core" {
 		t.Errorf("Init.Backend not parsed correctly")
 	}
 }
 
-func TestWorkspaceSourceWorkspaceEmpty(t *testing.T) {
-	// Test that source_workspace defaults to empty when not specified
+func TestWorkspacePreferWorkspaceEmpty(t *testing.T) {
+	// Test that prefer_workspace defaults to empty when not specified
 	yamlData := `
 path: /target/dev
 `
@@ -603,7 +604,86 @@ path: /target/dev
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if ws.SourceWorkspace != "" {
-		t.Errorf("SourceWorkspace = %q, want empty string", ws.SourceWorkspace)
+	if ws.PreferWorkspace != "" {
+		t.Errorf("PreferWorkspace = %q, want empty string", ws.PreferWorkspace)
+	}
+}
+
+func TestExtractMoveLineNumbers(t *testing.T) {
+	yamlData := []byte(`version: "1"
+source:
+  path: ./src
+target:
+  path: ./tgt
+migration:
+  moves:
+    - from: "aws_instance.old"
+      to: "aws_instance.new"
+    - from: { workspace: dev, resource: "module.foo" }
+      to: { workspace: networking, resource: "module.bar" }
+    - from: "aws_vpc.main"
+      to: "aws_vpc.main"
+`)
+
+	var cfg Config
+	if err := yaml.Unmarshal(yamlData, &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	extractMoveLineNumbers(yamlData, &cfg)
+
+	if len(cfg.Migration.Moves) != 3 {
+		t.Fatalf("expected 3 moves, got %d", len(cfg.Migration.Moves))
+	}
+
+	// Line numbers should be populated (exact values depend on YAML layout)
+	for i, mv := range cfg.Migration.Moves {
+		if mv.Line == 0 {
+			t.Errorf("move[%d]: expected non-zero line number", i)
+		}
+	}
+
+	// YAML content line numbers (1-indexed within the YAML data):
+	// line 1: version, 2: source, 3: path, 4: target, 5: path, 6: migration, 7: moves
+	// line 8: first move, line 10: second move, line 12: third move
+	if cfg.Migration.Moves[0].Line != 8 {
+		t.Errorf("move[0]: expected line 8, got %d", cfg.Migration.Moves[0].Line)
+	}
+	if cfg.Migration.Moves[1].Line != 10 {
+		t.Errorf("move[1]: expected line 10, got %d", cfg.Migration.Moves[1].Line)
+	}
+	if cfg.Migration.Moves[2].Line != 12 {
+		t.Errorf("move[2]: expected line 12, got %d", cfg.Migration.Moves[2].Line)
+	}
+}
+
+func TestMoveLineNumbersInErrors(t *testing.T) {
+	cfg := &Migration{
+		Moves: []Move{
+			{From: MoveFrom{Resource: "aws_vpc.main"}, To: MoveTo{Resource: "aws_vpc.main", Workspace: "networking"}, Line: 42},
+			{From: MoveFrom{Resource: "aws_vpc.main"}, To: MoveTo{Resource: "aws_vpc.main", Workspace: "compute"}, Line: 44},
+		},
+	}
+
+	sourceResources := SourceWorkspaceResources{
+		"default": {"aws_vpc.main", "aws_instance.web"},
+	}
+
+	targetToSource := map[string]string{
+		"networking": "default",
+		"compute":    "default",
+	}
+
+	_, err := BuildMigrationPlan(cfg, sourceResources, targetToSource, nil)
+	if err == nil {
+		t.Fatal("expected error for duplicate assignment")
+	}
+	errMsg := err.Error()
+	// Should contain line numbers
+	if !strings.Contains(errMsg, "line 42") {
+		t.Errorf("expected 'line 42' in error, got: %v", errMsg)
+	}
+	if !strings.Contains(errMsg, "line 44") {
+		t.Errorf("expected 'line 44' in error, got: %v", errMsg)
 	}
 }

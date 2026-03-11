@@ -28,6 +28,8 @@ type CLI struct {
 	Vars []string
 	// PlanConfig holds plan-specific configuration
 	PlanConfig *PlanConfig
+	// Debug enables verbose logging of commands
+	Debug bool
 }
 
 // NewCLI creates a new terraform CLI wrapper.
@@ -46,6 +48,35 @@ func NewCLIWithConfig(binary, workDir string, planCfg *PlanConfig) *CLI {
 	cli := NewCLI(binary, workDir)
 	cli.PlanConfig = planCfg
 	return cli
+}
+
+// WriteOverrideFiles writes any configured override files to the working directory.
+// These files are typically used to configure provider overrides for testing.
+// Returns a list of files written (for cleanup purposes).
+func (c *CLI) WriteOverrideFiles() ([]string, error) {
+	if c.PlanConfig == nil || len(c.PlanConfig.OverrideFiles) == 0 {
+		return nil, nil
+	}
+
+	var written []string
+	for filename, content := range c.PlanConfig.OverrideFiles {
+		path := filepath.Join(c.WorkDir, filename)
+		// Expand environment variables in content
+		expandedContent := ExpandEnv(content)
+		if err := os.WriteFile(path, []byte(expandedContent), 0644); err != nil {
+			return written, fmt.Errorf("failed to write override file %s: %w", filename, err)
+		}
+		written = append(written, path)
+	}
+
+	return written, nil
+}
+
+// CleanupOverrideFiles removes override files that were written.
+func (c *CLI) CleanupOverrideFiles(files []string) {
+	for _, path := range files {
+		os.Remove(path)
+	}
 }
 
 // Init runs terraform init.
@@ -110,8 +141,20 @@ func (c *CLI) Plan(ctx context.Context) (*tfjson.Plan, error) {
 	return &plan, nil
 }
 
+// PlanCheckResult contains the results of a plan check.
+type PlanCheckResult struct {
+	// HasChanges is true if the plan detected any resource changes.
+	HasChanges bool
+	// Output is the human-readable plan output.
+	Output string
+	// ChangedAddresses is the list of resource addresses that have changes.
+	// Only populated when HasChanges is true.
+	ChangedAddresses []string
+}
+
 // PlanHasChanges runs terraform plan and returns whether there are changes.
-func (c *CLI) PlanHasChanges(ctx context.Context) (bool, string, error) {
+// When changes are detected, it also runs a JSON plan to extract changed resource addresses.
+func (c *CLI) PlanHasChanges(ctx context.Context) (*PlanCheckResult, error) {
 	// Run plan with -detailed-exitcode
 	args := c.planArgs("")
 	args = append(args, "-detailed-exitcode")
@@ -121,14 +164,55 @@ func (c *CLI) PlanHasChanges(ctx context.Context) (bool, string, error) {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			// Exit code 2 means changes detected
 			if exitErr.ExitCode() == 2 {
-				return true, string(output), nil
+				// Get JSON plan to extract changed addresses
+				addresses, planErr := c.planChangedAddresses(ctx)
+				if planErr != nil {
+					// Fall back to reporting changes without addresses
+					return &PlanCheckResult{
+						HasChanges: true,
+						Output:     string(output),
+					}, nil
+				}
+				return &PlanCheckResult{
+					HasChanges:       true,
+					Output:           string(output),
+					ChangedAddresses: addresses,
+				}, nil
 			}
+			// Exit code 1 means error - include output in error message
+			return nil, fmt.Errorf("plan failed (exit code %d):\n%s", exitErr.ExitCode(), string(output))
 		}
-		return false, string(output), err
+		return nil, err
 	}
 
 	// Exit code 0 means no changes
-	return false, string(output), nil
+	return &PlanCheckResult{
+		HasChanges: false,
+		Output:     string(output),
+	}, nil
+}
+
+// planChangedAddresses runs a JSON plan and extracts addresses of changed resources.
+func (c *CLI) planChangedAddresses(ctx context.Context) ([]string, error) {
+	plan, err := c.Plan(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var addresses []string
+	if plan.ResourceChanges != nil {
+		for _, rc := range plan.ResourceChanges {
+			if rc.Change != nil && len(rc.Change.Actions) > 0 {
+				// Skip no-op changes
+				isNoop := len(rc.Change.Actions) == 1 && rc.Change.Actions[0] == tfjson.ActionNoop
+				if !isNoop {
+					addresses = append(addresses, rc.Address)
+				}
+			}
+		}
+	}
+
+	return addresses, nil
 }
 
 // StatePull pulls the current state and returns it as JSON bytes.
@@ -210,6 +294,10 @@ func (c *CLI) planArgs(outPath string) []string {
 
 // run executes a terraform command and returns stdout.
 func (c *CLI) run(ctx context.Context, args ...string) ([]byte, error) {
+	if c.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s %v (in %s)\n", c.Binary, args, c.WorkDir)
+	}
+
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
 	cmd.Dir = c.WorkDir
 	cmd.Env = append(os.Environ(), c.Env...)
@@ -222,11 +310,25 @@ func (c *CLI) run(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("%s %v failed: %w\nstderr: %s", c.Binary, args, err, stderr.String())
 	}
 
+	if c.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s %v completed\n", c.Binary, args)
+		if stdout.Len() > 0 {
+			fmt.Fprintf(os.Stderr, "[DEBUG] stdout:\n%s\n", stdout.String())
+		}
+		if stderr.Len() > 0 {
+			fmt.Fprintf(os.Stderr, "[DEBUG] stderr:\n%s\n", stderr.String())
+		}
+	}
+
 	return stdout.Bytes(), nil
 }
 
 // runWithExitCode executes a terraform command, returning output even on non-zero exit.
 func (c *CLI) runWithExitCode(ctx context.Context, args ...string) ([]byte, error) {
+	if c.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s %v (in %s)\n", c.Binary, args, c.WorkDir)
+	}
+
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
 	cmd.Dir = c.WorkDir
 	cmd.Env = append(os.Environ(), c.Env...)
@@ -238,6 +340,23 @@ func (c *CLI) runWithExitCode(ctx context.Context, args ...string) ([]byte, erro
 	err := cmd.Run()
 	// Combine stdout and stderr for full output
 	output := append(stdout.Bytes(), stderr.Bytes()...)
+
+	if c.Debug {
+		exitCode := 0
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			}
+		}
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s %v completed (exit=%d)\n", c.Binary, args, exitCode)
+		if stdout.Len() > 0 {
+			fmt.Fprintf(os.Stderr, "[DEBUG] stdout:\n%s\n", stdout.String())
+		}
+		if stderr.Len() > 0 {
+			fmt.Fprintf(os.Stderr, "[DEBUG] stderr:\n%s\n", stderr.String())
+		}
+	}
+
 	return output, err
 }
 
