@@ -4,6 +4,8 @@ package internal
 import (
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -71,6 +73,10 @@ type PlanConfig struct {
 	// IgnoreChanges is a list of resource addresses whose plan changes should be ignored.
 	// If a plan has changes but all changed resources are in this list, the plan is considered passing.
 	IgnoreChanges []string `yaml:"ignore_changes,omitempty"`
+	// IgnoreErrors is a list of resource addresses whose plan errors should be ignored.
+	// If a plan fails (exit code 1) but all error resource addresses are in this list,
+	// the plan is considered passing.
+	IgnoreErrors []string `yaml:"ignore_errors,omitempty"`
 }
 
 // Workspace represents a single terraform workspace configuration.
@@ -89,6 +95,9 @@ type Workspace struct {
 	// Takes precedence over Migration-level ProviderRemap.
 	// Example: {"aws.ireland": "aws"} remaps provider alias "ireland" to the default provider.
 	ProviderRemap map[string]string `yaml:"provider_remap,omitempty"`
+	// DependsOn lists target workspace names that must be planned before this one.
+	// Only affects plan validation ordering — migrations run independently.
+	DependsOn []string `yaml:"depends_on,omitempty"`
 }
 
 // Migration defines how state should be transformed.
@@ -367,13 +376,135 @@ func (t *Target) Validate() error {
 		return fmt.Errorf("cannot specify both path and workspaces")
 	}
 
+	// Validate single-workspace plan config
+	if err := validateTargetPlanConfig("default", t.Plan); err != nil {
+		return err
+	}
+
 	for name, ws := range t.Workspaces {
 		if ws.Path == "" {
 			return fmt.Errorf("workspace %q: path is required", name)
 		}
+		if err := validateTargetPlanConfig(name, ws.Plan); err != nil {
+			return err
+		}
+		// Validate depends_on references
+		for _, dep := range ws.DependsOn {
+			if _, ok := t.Workspaces[dep]; !ok {
+				return fmt.Errorf("workspace %q: depends_on references unknown workspace %q", name, dep)
+			}
+			if dep == name {
+				return fmt.Errorf("workspace %q: depends_on cannot reference itself", name)
+			}
+		}
+	}
+
+	// Check for dependency cycles
+	if err := validateNoCycles(t.Workspaces); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// validateTargetPlanConfig checks that a target workspace's plan config
+// doesn't contain options that are incompatible with tfsync's validation.
+func validateTargetPlanConfig(wsName string, plan *PlanConfig) error {
+	if plan == nil {
+		return nil
+	}
+	if plan.Refresh != nil && !*plan.Refresh {
+		return fmt.Errorf("workspace %q: plan.refresh=false is not allowed on target workspaces; "+
+			"tfsync validates migrations by running a real plan against the migrated state, "+
+			"which requires refresh to detect actual infrastructure drift", wsName)
+	}
+	return nil
+}
+
+// validateNoCycles checks that workspace depends_on doesn't form cycles.
+func validateNoCycles(workspaces map[string]Workspace) error {
+	// Standard DFS cycle detection with three states: unvisited, visiting, visited
+	const (
+		unvisited = 0
+		visiting  = 1
+		visited   = 2
+	)
+	state := make(map[string]int)
+
+	var visit func(name string, path []string) error
+	visit = func(name string, path []string) error {
+		if state[name] == visited {
+			return nil
+		}
+		if state[name] == visiting {
+			// Build cycle description
+			cycle := append(path, name)
+			return fmt.Errorf("depends_on cycle detected: %s", strings.Join(cycle, " -> "))
+		}
+		state[name] = visiting
+		ws := workspaces[name]
+		for _, dep := range ws.DependsOn {
+			if err := visit(dep, append(path, name)); err != nil {
+				return err
+			}
+		}
+		state[name] = visited
+		return nil
+	}
+
+	for name := range workspaces {
+		if err := visit(name, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TopologicalSort returns workspace names ordered so that dependencies come first.
+// Workspaces with no dependencies (or whose dependencies are all satisfied) can
+// run in parallel within the same "level". Returns a slice of levels, where each
+// level is a set of workspace names that can run concurrently.
+func TopologicalSort(workspaces map[string]Workspace) [][]string {
+	// Build in-degree counts and adjacency
+	inDegree := make(map[string]int)
+	dependents := make(map[string][]string) // dep -> list of workspaces that depend on it
+
+	for name := range workspaces {
+		inDegree[name] = 0
+	}
+	for name, ws := range workspaces {
+		for _, dep := range ws.DependsOn {
+			inDegree[name]++
+			dependents[dep] = append(dependents[dep], name)
+		}
+	}
+
+	// Kahn's algorithm, collecting nodes by level
+	var levels [][]string
+	var queue []string
+	for name, deg := range inDegree {
+		if deg == 0 {
+			queue = append(queue, name)
+		}
+	}
+	sort.Strings(queue) // deterministic ordering within levels
+
+	for len(queue) > 0 {
+		levels = append(levels, queue)
+		var next []string
+		for _, name := range queue {
+			for _, dep := range dependents[name] {
+				inDegree[dep]--
+				if inDegree[dep] == 0 {
+					next = append(next, dep)
+				}
+			}
+		}
+		sort.Strings(next)
+		queue = next
+	}
+
+	return levels
 }
 
 // Validate checks that the migration configuration is valid.

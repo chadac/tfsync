@@ -88,6 +88,12 @@ func LoadStateFromBytes(data []byte, path string) (*StateFile, error) {
 		return nil, fmt.Errorf("failed to parse state JSON: %w", err)
 	}
 
+	// Deduplicate instances within each resource block.
+	// Some corrupted state files contain multiple instances with the same index_key.
+	for i := range state.Resources {
+		state.Resources[i] = deduplicateInstances(state.Resources[i])
+	}
+
 	return &StateFile{
 		state: &state,
 		path:  path,
@@ -441,6 +447,39 @@ func stripInstanceIndex(addr string) string {
 	return addr // Malformed, return as-is
 }
 
+// instanceKey returns a comparable string representation of an instance's IndexKey.
+// IndexKey can be nil (no count/for_each), a float64 (count index), or a string (for_each key).
+func instanceKey(key interface{}) string {
+	if key == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%v", key)
+}
+
+// deduplicateInstances removes duplicate instances within a resource block,
+// keeping the last occurrence for each index_key. Some corrupted state files
+// contain multiple instances with the same key.
+func deduplicateInstances(r StateResource) StateResource {
+	if len(r.Instances) <= 1 {
+		return r
+	}
+	// Walk backwards so the last occurrence wins
+	seen := make(map[string]bool)
+	var deduped []StateResourceInstance
+	for i := len(r.Instances) - 1; i >= 0; i-- {
+		key := instanceKey(r.Instances[i].IndexKey)
+		if !seen[key] {
+			seen[key] = true
+			deduped = append(deduped, r.Instances[i])
+		}
+	}
+	// Reverse to restore original order
+	for i, j := 0, len(deduped)-1; i < j; i, j = i+1, j-1 {
+		deduped[i], deduped[j] = deduped[j], deduped[i]
+	}
+	r.Instances = deduped
+	return r
+}
 // BatchStateOperations allows performing multiple state operations efficiently.
 type BatchStateOperations struct {
 	sf          *StateFile

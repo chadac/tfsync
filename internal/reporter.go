@@ -96,6 +96,7 @@ type PlanResult struct {
 	Output           string
 	ChangedAddresses []string // Resource addresses that have changes
 	IgnoredAddresses []string // Resource addresses that were ignored via config
+	IgnoredErrors    []string // Resource addresses whose errors were ignored via config
 	Error            error
 }
 
@@ -120,11 +121,21 @@ func (r *Reporter) ReportPlanResults(results []PlanResult) bool {
 			}
 			allPassed = false
 		} else {
+			var notes []string
 			if len(res.IgnoredAddresses) > 0 {
-				r.Success("%sNo unexpected changes (ignored %d addresses)", prefix, len(res.IgnoredAddresses))
+				notes = append(notes, fmt.Sprintf("ignored %d changed addresses", len(res.IgnoredAddresses)))
+			}
+			if len(res.IgnoredErrors) > 0 {
+				notes = append(notes, fmt.Sprintf("ignored %d errored addresses", len(res.IgnoredErrors)))
+			}
+			if len(notes) > 0 {
+				r.Success("%sNo unexpected changes (%s)", prefix, strings.Join(notes, ", "))
 				if r.verbose {
 					for _, addr := range res.IgnoredAddresses {
-						r.Detail("  ignored: %s", addr)
+						r.Detail("  ignored change: %s", addr)
+					}
+					for _, addr := range res.IgnoredErrors {
+						r.Detail("  ignored error: %s", addr)
 					}
 				}
 			} else {

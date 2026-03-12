@@ -2,6 +2,7 @@ package internal
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -577,5 +578,92 @@ func TestStripInstanceIndex(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("stripInstanceIndex(%q) = %q, want %q", tt.input, got, tt.expected)
 		}
+	}
+}
+
+func TestDeduplicateInstances(t *testing.T) {
+	tests := []struct {
+		name              string
+		instances         []StateResourceInstance
+		expectedCount     int
+		expectedIndexKeys []interface{}
+	}{
+		{
+			name:          "no duplicates",
+			instances:     []StateResourceInstance{{IndexKey: nil}},
+			expectedCount: 1,
+			expectedIndexKeys: []interface{}{nil},
+		},
+		{
+			name: "duplicate nil keys - keeps last",
+			instances: []StateResourceInstance{
+				{IndexKey: nil, Private: "first"},
+				{IndexKey: nil, Private: "second"},
+				{IndexKey: nil, Private: "third"},
+			},
+			expectedCount:     1,
+			expectedIndexKeys: []interface{}{nil},
+		},
+		{
+			name: "duplicate numeric keys - keeps last",
+			instances: []StateResourceInstance{
+				{IndexKey: float64(0), Private: "first"},
+				{IndexKey: float64(0), Private: "second"},
+				{IndexKey: float64(1), Private: "only"},
+			},
+			expectedCount:     2,
+			expectedIndexKeys: []interface{}{float64(0), float64(1)},
+		},
+		{
+			name: "mixed duplicates",
+			instances: []StateResourceInstance{
+				{IndexKey: nil, Private: "first-nil"},
+				{IndexKey: float64(0), Private: "first-0"},
+				{IndexKey: nil, Private: "second-nil"},
+				{IndexKey: float64(0), Private: "second-0"},
+				{IndexKey: float64(1), Private: "only-1"},
+			},
+			expectedCount:     3,
+			expectedIndexKeys: []interface{}{nil, float64(0), float64(1)},
+		},
+		{
+			name:          "empty instances",
+			instances:     []StateResourceInstance{},
+			expectedCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := StateResource{
+				Type:      "aws_instance",
+				Name:      "test",
+				Mode:      "managed",
+				Instances: tt.instances,
+			}
+			result := deduplicateInstances(r)
+			if len(result.Instances) != tt.expectedCount {
+				t.Errorf("deduplicateInstances() returned %d instances, want %d", len(result.Instances), tt.expectedCount)
+				return
+			}
+			for i, expected := range tt.expectedIndexKeys {
+				got := result.Instances[i].IndexKey
+				if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", expected) {
+					t.Errorf("instance[%d].IndexKey = %v, want %v", i, got, expected)
+				}
+			}
+			// Verify "last wins" for duplicate nil keys
+			if tt.name == "duplicate nil keys - keeps last" && len(result.Instances) == 1 {
+				if result.Instances[0].Private != "third" {
+					t.Errorf("expected last instance to win, got Private=%q want %q", result.Instances[0].Private, "third")
+				}
+			}
+			// Verify "last wins" for duplicate numeric keys
+			if tt.name == "duplicate numeric keys - keeps last" && len(result.Instances) == 2 {
+				if result.Instances[0].Private != "second" {
+					t.Errorf("expected last instance to win for key 0, got Private=%q want %q", result.Instances[0].Private, "second")
+				}
+			}
+		})
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	tfjson "github.com/hashicorp/terraform-json"
 )
@@ -150,6 +151,8 @@ type PlanCheckResult struct {
 	// ChangedAddresses is the list of resource addresses that have changes.
 	// Only populated when HasChanges is true.
 	ChangedAddresses []string
+	// IgnoredErrors is the list of resource addresses whose errors were ignored.
+	IgnoredErrors []string
 }
 
 // PlanHasChanges runs terraform plan and returns whether there are changes.
@@ -179,7 +182,27 @@ func (c *CLI) PlanHasChanges(ctx context.Context) (*PlanCheckResult, error) {
 					ChangedAddresses: addresses,
 				}, nil
 			}
-			// Exit code 1 means error - include output in error message
+			// Exit code 1 means error - check if all errors can be ignored
+			if c.PlanConfig != nil && len(c.PlanConfig.IgnoreErrors) > 0 {
+				errorAddrs := parseErrorResourceAddresses(string(output))
+				if c.Debug {
+					fmt.Fprintf(os.Stderr, "[DEBUG] ignore_errors configured: %v\n", c.PlanConfig.IgnoreErrors)
+					fmt.Fprintf(os.Stderr, "[DEBUG] parsed error addresses: %v\n", errorAddrs)
+					// Dump lines containing "with" for debugging format issues
+					for _, line := range strings.Split(string(output), "\n") {
+						if strings.Contains(line, "with ") {
+							fmt.Fprintf(os.Stderr, "[DEBUG] line with 'with': %q\n", line)
+						}
+					}
+				}
+				if len(errorAddrs) > 0 && allAddressesIgnored(errorAddrs, c.PlanConfig.IgnoreErrors) {
+					return &PlanCheckResult{
+						HasChanges:    false,
+						Output:        string(output),
+						IgnoredErrors: errorAddrs,
+					}, nil
+				}
+			}
 			return nil, fmt.Errorf("plan failed (exit code %d):\n%s", exitErr.ExitCode(), string(output))
 		}
 		return nil, err
@@ -262,11 +285,16 @@ func (c *CLI) planArgs(outPath string) []string {
 		args = append(args, "-out="+outPath)
 	}
 
-	// Apply PlanConfig settings
+	// Default to -lock=false for validation plans (avoid lock contention in parallel plans).
+	// Users can explicitly set lock=true to override.
+	lockValue := false
+	if c.PlanConfig != nil && c.PlanConfig.Lock != nil {
+		lockValue = *c.PlanConfig.Lock
+	}
+	args = append(args, fmt.Sprintf("-lock=%t", lockValue))
+
+	// Apply other PlanConfig settings
 	if c.PlanConfig != nil {
-		if c.PlanConfig.Lock != nil {
-			args = append(args, fmt.Sprintf("-lock=%t", *c.PlanConfig.Lock))
-		}
 		if c.PlanConfig.Refresh != nil {
 			args = append(args, fmt.Sprintf("-refresh=%t", *c.PlanConfig.Refresh))
 		}
@@ -363,4 +391,84 @@ func (c *CLI) runWithExitCode(ctx context.Context, args ...string) ([]byte, erro
 // WorkDir returns the absolute working directory.
 func (c *CLI) AbsWorkDir() (string, error) {
 	return filepath.Abs(c.WorkDir)
+}
+
+// stripANSI removes ANSI escape sequences from a string.
+func stripANSI(s string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// Skip until we find the terminating letter
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				j++ // skip the terminating letter
+			}
+			i = j
+		} else {
+			result.WriteByte(s[i])
+			i++
+		}
+	}
+	return result.String()
+}
+
+// parseErrorResourceAddresses extracts resource addresses from terraform plan error output.
+// Terraform formats errors with lines like:
+//
+//	│ Error: reading S3 Object ...
+//	│
+//	│   with module.foo.aws_s3_object.bar[0],
+//
+// Only addresses within Error blocks are returned; Warning blocks are skipped.
+// The output may contain ANSI color codes and box-drawing characters.
+func parseErrorResourceAddresses(output string) []string {
+	// Strip ANSI escape sequences first
+	clean := stripANSI(output)
+	var addresses []string
+	seen := make(map[string]bool)
+	inErrorBlock := false
+	for _, line := range strings.Split(clean, "\n") {
+		trimmed := strings.TrimSpace(line)
+		// Strip box-drawing prefixes
+		stripped := strings.TrimPrefix(trimmed, "│")
+		stripped = strings.TrimPrefix(stripped, "|")
+		stripped = strings.TrimSpace(stripped)
+		// Track whether we're in an Error or Warning block
+		if strings.HasPrefix(stripped, "Error:") {
+			inErrorBlock = true
+		} else if strings.HasPrefix(stripped, "Warning:") {
+			inErrorBlock = false
+		} else if trimmed == "╷" {
+			// New diagnostic block — reset state until we see Error/Warning
+			inErrorBlock = false
+		}
+		if inErrorBlock && strings.HasPrefix(stripped, "with ") && strings.HasSuffix(stripped, ",") {
+			addr := strings.TrimPrefix(stripped, "with ")
+			addr = strings.TrimSuffix(addr, ",")
+			addr = strings.TrimSpace(addr)
+			if addr != "" && !seen[addr] {
+				seen[addr] = true
+				addresses = append(addresses, addr)
+			}
+		}
+	}
+	return addresses
+}
+
+// allAddressesIgnored returns true if every address in addrs is present in the ignoreList.
+func allAddressesIgnored(addrs []string, ignoreList []string) bool {
+	ignoreSet := make(map[string]bool, len(ignoreList))
+	for _, a := range ignoreList {
+		ignoreSet[a] = true
+	}
+	for _, a := range addrs {
+		if !ignoreSet[a] {
+			return false
+		}
+	}
+	return true
 }

@@ -275,9 +275,27 @@ func (c *Copier) PullSourceState(ctx context.Context, sourceDir string, initCfg 
 }
 
 // WriteStateToTarget writes cached state data to a target directory.
+// The state is loaded, deduplicated, and re-serialized to clean up any
+// corrupted state files with duplicate resource instances.
 func (c *Copier) WriteStateToTarget(cached *CachedState, targetDir string) error {
 	localStatePath := filepath.Join(targetDir, "terraform.tfstate")
-	if err := os.WriteFile(localStatePath, cached.StateData, 0644); err != nil {
+
+	// Load through StateFile to get deduplication, then re-serialize
+	sf, err := LoadStateFromBytes(cached.StateData, localStatePath)
+	if err != nil {
+		// Fallback to writing raw bytes if we can't parse
+		if writeErr := os.WriteFile(localStatePath, cached.StateData, 0644); writeErr != nil {
+			return fmt.Errorf("failed to write local state: %w", writeErr)
+		}
+		return nil
+	}
+
+	// Write directly without incrementing serial (this is the initial write, not a mutation)
+	data, err := json.MarshalIndent(sf.GetState(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal state: %w", err)
+	}
+	if err := os.WriteFile(localStatePath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write local state: %w", err)
 	}
 	return nil

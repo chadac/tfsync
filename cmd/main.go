@@ -521,7 +521,9 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 		rep.Success("Initialized %d targets", len(initWsNames))
 	}
 
-	// Phase 6: Run plans to validate (in parallel)
+	// Phase 6: Run plans to validate, respecting depends_on ordering.
+	// Workspaces are planned in topological levels — each level runs in parallel,
+	// but a level only starts after the previous level completes.
 	rep.Header("Validating Plans")
 
 	// Build list of workspaces for progress tracking
@@ -531,72 +533,83 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	}
 	planProgress := rep.NewParallelProgress(wsNames)
 
-	// Run plans in parallel
 	type planResult struct {
 		workspace        string
 		hasChanges       bool
 		output           string
 		changedAddresses []string
 		ignoredAddresses []string
+		ignoredErrors    []string
 		err              error
 	}
 
-	planResultsChan := make(chan planResult, len(targetWorkspaces))
-	var planWg sync.WaitGroup
+	levels := internal.TopologicalSort(targetWorkspaces)
 
-	for wsName, targetWs := range targetWorkspaces {
-		planWg.Add(1)
-		go func(wsName string, targetWs internal.Workspace) {
-			defer planWg.Done()
+	var allPlanResults []planResult
 
-			planProgress.Update(wsName, "planning")
+	for _, level := range levels {
+		levelResultsChan := make(chan planResult, len(level))
+		var levelWg sync.WaitGroup
 
-			absTargetDir, _ := filepath.Abs(targetWs.Path)
-			cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
-			cli.Debug = debug
-
-			if cfg.TF != nil {
-				cli.Parallelism = cfg.TF.Parallelism
-				cli.VarFiles = cfg.TF.VarFiles
-				cli.Vars = cfg.TF.Vars
+		for _, wsName := range level {
+			targetWs, ok := targetWorkspaces[wsName]
+			if !ok {
+				continue // targeted run — workspace not in this execution
 			}
+			levelWg.Add(1)
+			go func(wsName string, targetWs internal.Workspace) {
+				defer levelWg.Done()
 
-			// Write any override files (e.g., provider overrides for testing)
-			overrideFiles, err := cli.WriteOverrideFiles()
-			if err != nil {
-				planProgress.Fail(wsName, err)
-				planResultsChan <- planResult{workspace: wsName, err: err}
-				return
-			}
-			defer cli.CleanupOverrideFiles(overrideFiles)
+				planProgress.Update(wsName, "planning")
 
-			checkResult, err := cli.PlanHasChanges(ctx)
+				absTargetDir, _ := filepath.Abs(targetWs.Path)
+				cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
+				cli.Debug = debug
 
-			if err != nil {
-				planProgress.Fail(wsName, err)
-				planResultsChan <- planResult{workspace: wsName, err: err}
-				return
-			}
+				if cfg.TF != nil {
+					cli.Parallelism = cfg.TF.Parallelism
+					cli.VarFiles = cfg.TF.VarFiles
+					cli.Vars = cfg.TF.Vars
+				}
 
-			// Apply ignore_changes filtering
-			hasChanges, changedAddrs, ignoredAddrs := filterIgnoredChanges(
-				checkResult.HasChanges, checkResult.ChangedAddresses, targetWs.GetPlanConfig(),
-			)
+				overrideFiles, err := cli.WriteOverrideFiles()
+				if err != nil {
+					planProgress.Fail(wsName, err)
+					levelResultsChan <- planResult{workspace: wsName, err: err}
+					return
+				}
+				defer cli.CleanupOverrideFiles(overrideFiles)
 
-			planProgress.Complete(wsName)
-			planResultsChan <- planResult{
-				workspace:        wsName,
-				hasChanges:       hasChanges,
-				output:           checkResult.Output,
-				changedAddresses: changedAddrs,
-				ignoredAddresses: ignoredAddrs,
-			}
-		}(wsName, targetWs)
+				checkResult, err := cli.PlanHasChanges(ctx)
+				if err != nil {
+					planProgress.Fail(wsName, err)
+					levelResultsChan <- planResult{workspace: wsName, err: err}
+					return
+				}
+
+				hasChanges, changedAddrs, ignoredAddrs := filterIgnoredChanges(
+					checkResult.HasChanges, checkResult.ChangedAddresses, targetWs.GetPlanConfig(),
+				)
+
+				planProgress.Complete(wsName)
+				levelResultsChan <- planResult{
+					workspace:        wsName,
+					hasChanges:       hasChanges,
+					output:           checkResult.Output,
+					changedAddresses: changedAddrs,
+					ignoredAddresses: ignoredAddrs,
+					ignoredErrors:    checkResult.IgnoredErrors,
+				}
+			}(wsName, targetWs)
+		}
+
+		levelWg.Wait()
+		close(levelResultsChan)
+
+		for res := range levelResultsChan {
+			allPlanResults = append(allPlanResults, res)
+		}
 	}
-
-	// Wait for all plans to complete
-	planWg.Wait()
-	close(planResultsChan)
 	planProgress.Finish()
 
 	// Collect results and check for errors
@@ -604,7 +617,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	var firstPlanErr error
 	var failedWorkspace string
 
-	for res := range planResultsChan {
+	for _, res := range allPlanResults {
 		if res.err != nil && firstPlanErr == nil {
 			firstPlanErr = res.err
 			failedWorkspace = res.workspace
@@ -615,6 +628,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 			Output:           res.output,
 			ChangedAddresses: res.changedAddresses,
 			IgnoredAddresses: res.ignoredAddresses,
+			IgnoredErrors:    res.ignoredErrors,
 			Error:            res.err,
 		})
 	}
@@ -951,7 +965,7 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		rep.Success("Initialized %d targets", len(initWsNames))
 	}
 
-	// Phase 6: Run plans to validate (in parallel)
+	// Phase 6: Run plans to validate (respecting dependency order)
 	rep.Header("Validating Plans")
 
 	var wsNames []string
@@ -966,70 +980,85 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		output           string
 		changedAddresses []string
 		ignoredAddresses []string
+		ignoredErrors    []string
 		err              error
 	}
 
-	planResultsChan := make(chan planResult, len(targetWorkspaces))
-	var planWg sync.WaitGroup
+	levels := internal.TopologicalSort(targetWorkspaces)
 
-	for wsName, targetWs := range targetWorkspaces {
-		planWg.Add(1)
-		go func(wsName string, targetWs internal.Workspace) {
-			defer planWg.Done()
+	var allPlanResults []planResult
 
-			planProgress.Update(wsName, "planning")
+	for _, level := range levels {
+		levelResultsChan := make(chan planResult, len(level))
+		var levelWg sync.WaitGroup
 
-			absTargetDir, _ := filepath.Abs(targetWs.Path)
-			cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
-			cli.Debug = debug
-
-			if cfg.TF != nil {
-				cli.Parallelism = cfg.TF.Parallelism
-				cli.VarFiles = cfg.TF.VarFiles
-				cli.Vars = cfg.TF.Vars
+		for _, wsName := range level {
+			targetWs, ok := targetWorkspaces[wsName]
+			if !ok {
+				continue // workspace not in this execution
 			}
+			levelWg.Add(1)
+			go func(wsName string, targetWs internal.Workspace) {
+				defer levelWg.Done()
 
-			overrideFiles, err := cli.WriteOverrideFiles()
-			if err != nil {
-				planProgress.Fail(wsName, err)
-				planResultsChan <- planResult{workspace: wsName, err: err}
-				return
-			}
-			defer cli.CleanupOverrideFiles(overrideFiles)
+				planProgress.Update(wsName, "planning")
 
-			checkResult, err := cli.PlanHasChanges(ctx)
+				absTargetDir, _ := filepath.Abs(targetWs.Path)
+				cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
+				cli.Debug = debug
 
-			if err != nil {
-				planProgress.Fail(wsName, err)
-				planResultsChan <- planResult{workspace: wsName, err: err}
-				return
-			}
+				if cfg.TF != nil {
+					cli.Parallelism = cfg.TF.Parallelism
+					cli.VarFiles = cfg.TF.VarFiles
+					cli.Vars = cfg.TF.Vars
+				}
 
-			// Apply ignore_changes filtering
-			hasChanges, changedAddrs, ignoredAddrs := filterIgnoredChanges(
-				checkResult.HasChanges, checkResult.ChangedAddresses, targetWs.GetPlanConfig(),
-			)
+				overrideFiles, err := cli.WriteOverrideFiles()
+				if err != nil {
+					planProgress.Fail(wsName, err)
+					levelResultsChan <- planResult{workspace: wsName, err: err}
+					return
+				}
+				defer cli.CleanupOverrideFiles(overrideFiles)
 
-			planProgress.Complete(wsName)
-			planResultsChan <- planResult{
-				workspace:        wsName,
-				hasChanges:       hasChanges,
-				output:           checkResult.Output,
-				changedAddresses: changedAddrs,
-				ignoredAddresses: ignoredAddrs,
-			}
-		}(wsName, targetWs)
+				checkResult, err := cli.PlanHasChanges(ctx)
+				if err != nil {
+					planProgress.Fail(wsName, err)
+					levelResultsChan <- planResult{workspace: wsName, err: err}
+					return
+				}
+
+				// Apply ignore_changes filtering
+				hasChanges, changedAddrs, ignoredAddrs := filterIgnoredChanges(
+					checkResult.HasChanges, checkResult.ChangedAddresses, targetWs.GetPlanConfig(),
+				)
+
+				planProgress.Complete(wsName)
+				levelResultsChan <- planResult{
+					workspace:        wsName,
+					hasChanges:       hasChanges,
+					output:           checkResult.Output,
+					changedAddresses: changedAddrs,
+					ignoredAddresses: ignoredAddrs,
+					ignoredErrors:    checkResult.IgnoredErrors,
+				}
+			}(wsName, targetWs)
+		}
+
+		levelWg.Wait()
+		close(levelResultsChan)
+
+		for res := range levelResultsChan {
+			allPlanResults = append(allPlanResults, res)
+		}
 	}
-
-	planWg.Wait()
-	close(planResultsChan)
 	planProgress.Finish()
 
 	var planResults []internal.PlanResult
 	var firstPlanErr error
 	var failedWorkspace string
 
-	for res := range planResultsChan {
+	for _, res := range allPlanResults {
 		if res.err != nil && firstPlanErr == nil {
 			firstPlanErr = res.err
 			failedWorkspace = res.workspace
@@ -1040,6 +1069,7 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 			Output:           res.output,
 			ChangedAddresses: res.changedAddresses,
 			IgnoredAddresses: res.ignoredAddresses,
+			IgnoredErrors:    res.ignoredErrors,
 			Error:            res.err,
 		})
 	}

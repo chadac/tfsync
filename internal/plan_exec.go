@@ -141,7 +141,7 @@ func (e *Executor) executeWorkspacePlan(wsName, targetDir string, wsPlan *Worksp
 			continue
 		}
 		if r, ok := resourceIndex[baseAddr]; ok {
-			newState.Resources = append(newState.Resources, r)
+			newState.Resources = append(newState.Resources, deduplicateInstances(r))
 			addedResources[baseAddr] = true
 			if e.debug {
 				fmt.Printf("[DEBUG] workspace %q: keeping %q\n", wsName, baseAddr)
@@ -170,7 +170,7 @@ func (e *Executor) executeWorkspacePlan(wsName, targetDir string, wsPlan *Worksp
 		} else {
 			r.Mode = "managed"
 		}
-		newState.Resources = append(newState.Resources, r)
+		newState.Resources = append(newState.Resources, deduplicateInstances(r))
 		addedResources[baseFromAddr] = true
 		moved++
 		if e.debug {
@@ -184,7 +184,7 @@ func (e *Executor) executeWorkspacePlan(wsName, targetDir string, wsPlan *Worksp
 		for _, r := range sourceState.Resources {
 			if r.Module == fromModule {
 				r.Module = toModule
-				newState.Resources = append(newState.Resources, r)
+				newState.Resources = append(newState.Resources, deduplicateInstances(r))
 				moved++
 			} else if len(r.Module) > len(srcPrefix) && r.Module[:len(srcPrefix)] == srcPrefix {
 				// Nested module under fromModule
@@ -193,7 +193,7 @@ func (e *Executor) executeWorkspacePlan(wsName, targetDir string, wsPlan *Worksp
 					dstPrefix = toModule + "."
 				}
 				r.Module = dstPrefix + r.Module[len(srcPrefix):]
-				newState.Resources = append(newState.Resources, r)
+				newState.Resources = append(newState.Resources, deduplicateInstances(r))
 				moved++
 			}
 		}

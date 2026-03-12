@@ -80,13 +80,13 @@ func TestCLIPlanArgs(t *testing.T) {
 			name:         "basic plan args",
 			cli:          NewCLI("tofu", "/test"),
 			outPath:      "",
-			expectedArgs: []string{"plan", "-input=false"},
+			expectedArgs: []string{"plan", "-input=false", "-lock=false"},
 		},
 		{
 			name:         "with output path",
 			cli:          NewCLI("tofu", "/test"),
 			outPath:      "/tmp/plan.out",
-			expectedArgs: []string{"plan", "-input=false", "-out=/tmp/plan.out"},
+			expectedArgs: []string{"plan", "-input=false", "-out=/tmp/plan.out", "-lock=false"},
 		},
 		{
 			name: "with lock=false",
@@ -116,7 +116,7 @@ func TestCLIPlanArgs(t *testing.T) {
 				PlanConfig: &PlanConfig{Refresh: &refreshFalse},
 			},
 			outPath:      "",
-			expectedArgs: []string{"plan", "-input=false", "-refresh=false"},
+			expectedArgs: []string{"plan", "-input=false", "-lock=false", "-refresh=false"},
 		},
 		{
 			name: "with parallelism",
@@ -126,7 +126,7 @@ func TestCLIPlanArgs(t *testing.T) {
 				Parallelism: 10,
 			},
 			outPath:      "",
-			expectedArgs: []string{"plan", "-input=false", "-parallelism=10"},
+			expectedArgs: []string{"plan", "-input=false", "-lock=false", "-parallelism=10"},
 		},
 		{
 			name: "with var files",
@@ -136,7 +136,7 @@ func TestCLIPlanArgs(t *testing.T) {
 				VarFiles: []string{"vars.tfvars", "prod.tfvars"},
 			},
 			outPath:      "",
-			expectedArgs: []string{"plan", "-input=false", "-var-file=vars.tfvars", "-var-file=prod.tfvars"},
+			expectedArgs: []string{"plan", "-input=false", "-lock=false", "-var-file=vars.tfvars", "-var-file=prod.tfvars"},
 		},
 		{
 			name: "with vars",
@@ -146,7 +146,7 @@ func TestCLIPlanArgs(t *testing.T) {
 				Vars:    []string{"foo=bar", "baz=qux"},
 			},
 			outPath:      "",
-			expectedArgs: []string{"plan", "-input=false", "-var=foo=bar", "-var=baz=qux"},
+			expectedArgs: []string{"plan", "-input=false", "-lock=false", "-var=foo=bar", "-var=baz=qux"},
 		},
 		{
 			name: "with extra args",
@@ -158,7 +158,7 @@ func TestCLIPlanArgs(t *testing.T) {
 				},
 			},
 			outPath:      "",
-			expectedArgs: []string{"plan", "-input=false", "-compact-warnings", "-no-color"},
+			expectedArgs: []string{"plan", "-input=false", "-lock=false", "-compact-warnings", "-no-color"},
 		},
 		{
 			name: "combined options",
@@ -207,7 +207,7 @@ func TestCLIPlanArgsWithEnvExpansion(t *testing.T) {
 	}
 
 	result := cli.planArgs("")
-	expectedArgs := []string{"plan", "-input=false", "-target=module.foo"}
+	expectedArgs := []string{"plan", "-input=false", "-lock=false", "-target=module.foo"}
 
 	if len(result) != len(expectedArgs) {
 		t.Errorf("planArgs() returned %d args, want %d\ngot:  %v\nwant: %v",
@@ -255,6 +255,164 @@ func TestTFGetTool(t *testing.T) {
 			result := tt.tf.GetTool()
 			if result != tt.expected {
 				t.Errorf("GetTool() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseErrorResourceAddresses(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected []string
+	}{
+		{
+			name:     "no errors",
+			output:   "No changes. Your infrastructure matches the configuration.",
+			expected: nil,
+		},
+		{
+			name: "single error",
+			output: `╷
+│ Error: reading S3 Object (bucket/key): Forbidden
+│ 
+│   with module.stack.aws_s3_object.data[0],
+│   on main.tf line 1, in resource "aws_s3_object" "data":
+│    1: resource "aws_s3_object" "data" {
+│ 
+╵`,
+			expected: []string{"module.stack.aws_s3_object.data[0]"},
+		},
+		{
+			name: "multiple errors",
+			output: `╷
+│ Error: reading S3 Object (bucket/input/): Forbidden
+│ 
+│   with module.stack.aws_s3_object.inbound[0],
+│   on s3_dir.tf line 1, in resource "aws_s3_object" "inbound":
+│    1: resource "aws_s3_object" "inbound" {
+│ 
+╵
+╷
+│ Error: reading S3 Object (bucket/output/): Forbidden
+│ 
+│   with module.stack.aws_s3_object.outbound[0],
+│   on s3_dir.tf line 11, in resource "aws_s3_object" "outbound":
+│   11: resource "aws_s3_object" "outbound" {
+│ 
+╵`,
+			expected: []string{
+				"module.stack.aws_s3_object.inbound[0]",
+				"module.stack.aws_s3_object.outbound[0]",
+			},
+		},
+		{
+			name:   "with ANSI color codes",
+			output: "\x1b[31m│\x1b[0m \x1b[0mError: reading S3 Object\x1b[0m\n\x1b[31m│\x1b[0m \x1b[0m\x1b[0m  with module.stack.aws_s3_object.inbound[0],\n╷\n\x1b[31m│\x1b[0m \x1b[0mError: reading S3 Object\x1b[0m\n\x1b[31m│\x1b[0m \x1b[0m\x1b[0m  with module.stack.aws_s3_object.outbound[0],",
+			expected: []string{
+				"module.stack.aws_s3_object.inbound[0]",
+				"module.stack.aws_s3_object.outbound[0]",
+			},
+		},
+		{
+			name: "duplicate addresses deduplicated",
+			output: `╷
+│ Error: some error
+│   with aws_instance.foo,
+╵
+╷
+│ Error: some error
+│   with aws_instance.foo,
+╵`,
+			expected: []string{"aws_instance.foo"},
+		},
+		{
+			name: "warning addresses excluded",
+			output: `╷
+│ Warning: Argument is deprecated
+│ 
+│   with module.stack.aws_iam_role.this,
+│ 
+╵
+╷
+│ Error: reading S3 Object: Forbidden
+│ 
+│   with module.stack.aws_s3_object.data[0],
+│ 
+╵`,
+			expected: []string{"module.stack.aws_s3_object.data[0]"},
+		},
+		{
+			name: "error without resource address",
+			output: `╷
+│ Error: Error configuring provider
+│ 
+│ Some provider error
+╵`,
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := parseErrorResourceAddresses(tt.output)
+			if len(result) != len(tt.expected) {
+				t.Errorf("parseErrorResourceAddresses() = %v, want %v", result, tt.expected)
+				return
+			}
+			for i, addr := range tt.expected {
+				if result[i] != addr {
+					t.Errorf("parseErrorResourceAddresses()[%d] = %q, want %q", i, result[i], addr)
+				}
+			}
+		})
+	}
+}
+
+func TestAllAddressesIgnored(t *testing.T) {
+	tests := []struct {
+		name       string
+		addrs      []string
+		ignoreList []string
+		expected   bool
+	}{
+		{
+			name:       "all ignored",
+			addrs:      []string{"aws_s3_object.foo[0]", "aws_s3_object.bar[0]"},
+			ignoreList: []string{"aws_s3_object.foo[0]", "aws_s3_object.bar[0]"},
+			expected:   true,
+		},
+		{
+			name:       "some not ignored",
+			addrs:      []string{"aws_s3_object.foo[0]", "aws_instance.web"},
+			ignoreList: []string{"aws_s3_object.foo[0]"},
+			expected:   false,
+		},
+		{
+			name:       "empty addrs",
+			addrs:      []string{},
+			ignoreList: []string{"aws_s3_object.foo[0]"},
+			expected:   true,
+		},
+		{
+			name:       "empty ignore list",
+			addrs:      []string{"aws_s3_object.foo[0]"},
+			ignoreList: []string{},
+			expected:   false,
+		},
+		{
+			name:       "superset ignore list",
+			addrs:      []string{"aws_s3_object.foo[0]"},
+			ignoreList: []string{"aws_s3_object.foo[0]", "aws_s3_object.bar[0]", "aws_instance.web"},
+			expected:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := allAddressesIgnored(tt.addrs, tt.ignoreList)
+			if result != tt.expected {
+				t.Errorf("allAddressesIgnored(%v, %v) = %v, want %v", tt.addrs, tt.ignoreList, result, tt.expected)
 			}
 		})
 	}
