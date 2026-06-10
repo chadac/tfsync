@@ -88,6 +88,12 @@ func LoadStateFromBytes(data []byte, path string) (*StateFile, error) {
 		return nil, fmt.Errorf("failed to parse state JSON: %w", err)
 	}
 
+	// Deduplicate resource blocks with the same address.
+	// Some corrupted state files contain the same resource address multiple times
+	// in the resources array (e.g., from a botched terraform import or state push).
+	// When duplicates exist, we merge their instances into a single resource block.
+	state.Resources = deduplicateResources(state.Resources)
+
 	// Deduplicate instances within each resource block.
 	// Some corrupted state files contain multiple instances with the same index_key.
 	for i := range state.Resources {
@@ -278,6 +284,19 @@ func (sf *StateFile) MoveResources(moves map[string]string) int {
 // GetState returns the underlying state for direct access.
 func (sf *StateFile) GetState() *TerraformState {
 	return sf.state
+}
+
+// InjectOutputs writes output values into the state file's outputs section.
+// Each output is a map with "value", "type", and optionally "sensitive" keys,
+// matching terraform's state file format.
+func (sf *StateFile) InjectOutputs(outputs map[string]interface{}) error {
+	if sf.state.Outputs == nil {
+		sf.state.Outputs = make(map[string]interface{})
+	}
+	for k, v := range outputs {
+		sf.state.Outputs[k] = v
+	}
+	return sf.Save()
 }
 
 // parseStateAddress parses a terraform resource address into its components.
@@ -480,6 +499,35 @@ func deduplicateInstances(r StateResource) StateResource {
 	r.Instances = deduped
 	return r
 }
+
+// deduplicateResources removes duplicate resource blocks with the same address,
+// keeping the last occurrence to match terraform's behavior. When terraform reads
+// a state file with duplicate resource blocks, it iterates the JSON array and
+// overwrites map entries, so the last block wins. We must do the same to ensure
+// the migrated state matches what terraform would see.
+func deduplicateResources(resources []StateResource) []StateResource {
+	// Walk backwards so the last occurrence wins (matching terraform behavior)
+	seen := make(map[string]bool)
+	var deduped []StateResource
+	for i := len(resources) - 1; i >= 0; i-- {
+		addr := resources[i].Address()
+		if !seen[addr] {
+			seen[addr] = true
+			deduped = append(deduped, resources[i])
+		}
+	}
+
+	if len(deduped) == len(resources) {
+		return resources // no duplicates
+	}
+
+	// Reverse to restore original order
+	for i, j := 0, len(deduped)-1; i < j; i, j = i+1, j-1 {
+		deduped[i], deduped[j] = deduped[j], deduped[i]
+	}
+	return deduped
+}
+
 // BatchStateOperations allows performing multiple state operations efficiently.
 type BatchStateOperations struct {
 	sf          *StateFile
@@ -735,6 +783,37 @@ func ExtractResourceProviders(stateData []byte) (map[string]string, error) {
 	result := make(map[string]string)
 	for _, r := range sf.GetState().Resources {
 		result[r.Address()] = r.Provider
+	}
+	return result, nil
+}
+
+// SourceResourceDependencies maps source workspace name -> resource address -> dependency addresses.
+type SourceResourceDependencies map[string]map[string][]string
+
+// ExtractResourceDependencies extracts resource dependency information from state data.
+// Returns a map of resource address -> list of dependency addresses.
+// Dependencies are collected from all instances of each resource and deduplicated.
+func ExtractResourceDependencies(stateData []byte) (map[string][]string, error) {
+	sf, err := LoadStateFromBytes(stateData, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]string)
+	for _, r := range sf.GetState().Resources {
+		addr := r.Address()
+		seen := make(map[string]bool)
+		var deps []string
+		for _, inst := range r.Instances {
+			for _, dep := range inst.Dependencies {
+				if !seen[dep] {
+					seen[dep] = true
+					deps = append(deps, dep)
+				}
+			}
+		}
+		if len(deps) > 0 {
+			result[addr] = deps
+		}
 	}
 	return result, nil
 }

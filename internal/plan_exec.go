@@ -12,13 +12,19 @@ import (
 // validated plan rather than computing operations on the fly.
 //
 // targetDirs maps target workspace name -> absolute directory path.
+// stateFileNames maps target workspace name -> state file name (optional, defaults to "terraform.tfstate").
 // statusFn is an optional callback for progress reporting.
 func (e *Executor) ExecutePlan(
 	ctx context.Context,
 	plan *MigrationPlan,
 	targetDirs map[string]string,
 	statusFn MigrationStatusCallback,
+	stateFileNames ...map[string]string,
 ) (*Result, error) {
+	sfNames := map[string]string{}
+	if len(stateFileNames) > 0 && stateFileNames[0] != nil {
+		sfNames = stateFileNames[0]
+	}
 	result := &Result{}
 
 	// Process workspaces in parallel
@@ -42,7 +48,8 @@ func (e *Executor) ExecutePlan(
 				statusFn(wsName, "migrating")
 			}
 
-			moved, err := e.executeWorkspacePlan(wsName, targetDir, wsPlan)
+			sfName := sfNames[wsName] // empty string means default
+			moved, err := e.executeWorkspacePlan(wsName, targetDir, wsPlan, sfName)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -94,8 +101,11 @@ func (e *Executor) ExecutePlan(
 // Instead of copying the full source state and then removing/renaming, this
 // builds the target state from scratch by selecting only the needed resources.
 // Returns the number of moves executed.
-func (e *Executor) executeWorkspacePlan(wsName, targetDir string, wsPlan *WorkspacePlan) (int, error) {
-	statePath := targetDir + "/terraform.tfstate"
+func (e *Executor) executeWorkspacePlan(wsName, targetDir string, wsPlan *WorkspacePlan, stateFileName string) (int, error) {
+	if stateFileName == "" {
+		stateFileName = "terraform.tfstate"
+	}
+	statePath := targetDir + "/" + stateFileName
 	sourceSF, err := LoadStateFile(statePath)
 	if err != nil {
 		if os.IsNotExist(err) {

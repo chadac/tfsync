@@ -104,7 +104,7 @@ func TestExecuteWorkspacePlan_KeepOnly(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestExecuteWorkspacePlan_IndividualMoves(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestExecuteWorkspacePlan_MoveToModule(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestExecuteWorkspacePlan_ModuleMove(t *testing.T) {
 		},
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestExecuteWorkspacePlan_NoOutputsCopied(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	_, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	_, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestExecuteWorkspacePlan_EmptyPlan(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestExecuteWorkspacePlan_MoveNotFound(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	_, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	_, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err == nil {
 		t.Fatal("expected error for missing move source, got nil")
 	}
@@ -394,7 +394,7 @@ func TestExecuteWorkspacePlan_PreservesInstances(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestExecuteWorkspacePlan_PreservesMetadata(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	_, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	_, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -492,7 +492,7 @@ func TestExecuteWorkspacePlan_DataSource(t *testing.T) {
 		ModuleMoves: make(map[string]string),
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -546,7 +546,7 @@ func TestExecuteWorkspacePlan_ProviderRemap(t *testing.T) {
 		},
 	}
 
-	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	moved, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -585,7 +585,7 @@ func TestExecuteWorkspacePlan_ProviderRemapNoMatch(t *testing.T) {
 		},
 	}
 
-	_, err := executor.executeWorkspacePlan("test", dir, wsPlan)
+	_, err := executor.executeWorkspacePlan("test", dir, wsPlan, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

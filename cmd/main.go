@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 
@@ -25,6 +26,7 @@ var (
 	dryRun     bool
 	noCleanup  bool
 	refresh    bool
+
 )
 
 func main() {
@@ -237,6 +239,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 }
 
 func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Reporter) error {
+	// Clean output directory from previous run
+	internal.CleanOutputDir()
+
 	binary := cfg.TF.GetTool()
 
 	// Create copier with caching enabled
@@ -247,6 +252,8 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	executor.SetDebug(debug)
 
 	sourceWorkspaces := cfg.Source.GetWorkspaces()
+	cfg.Target.AutoSetTFDataDir()
+	cfg.Target.AutoSetSharedPathFiles()
 	targetWorkspaces := cfg.Target.GetWorkspaces()
 
 	// Track directories for cleanup
@@ -282,7 +289,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 
 		rep.Step("Pulling state from %s", srcWs.Path)
 
-		pullResult, err := copier.PullSourceState(ctx, absSrcDir, srcWs.GetInitConfig(), refresh)
+		pullResult, err := copier.PullSourceState(ctx, absSrcDir, srcWs.GetInitConfig(), refresh, srcWs.GetEnvSlice()...)
 		if err != nil {
 			rep.Error("Failed to pull source state: %v", err)
 			return err
@@ -301,15 +308,108 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 		rep.Success("Pulled state for %s (%d resources)", srcName, len(pullResult.State.Resources))
 	}
 
+	// Phase 1b: Run plans on source workspaces to detect upstream drift.
+	// Results are cached to avoid re-running expensive source plans on every run.
+	// Use --refresh (-r) to force re-running source plans.
+	rep.Header("Checking Source Drift")
+
+	// sourceDiffs maps source workspace name -> list of resource diffs from source plan
+	sourceDiffs := make(map[string][]internal.ResourceDiff)
+	sourceOutputs := make(map[string]string)
+	var sourceDiffMu sync.Mutex
+
+	{
+		var srcNames []string
+		for name := range sourceWorkspaces {
+			srcNames = append(srcNames, name)
+		}
+		srcProgress := rep.NewParallelProgress(srcNames)
+		gSrc, _ := errgroup.WithContext(ctx)
+
+		for srcName, srcWs := range sourceWorkspaces {
+			srcName, srcWs := srcName, srcWs
+			gSrc.Go(func() error {
+				absSrcDir, _ := filepath.Abs(srcWs.Path)
+
+				// Check drift cache (skip if --refresh)
+				if cache != nil && !refresh {
+					cached, err := cache.GetDrift(absSrcDir, srcWs.GetInitConfig())
+					if err == nil && cached != nil {
+						sourceDiffMu.Lock()
+						sourceDiffs[srcName] = cached.ResourceDiffs
+						sourceOutputs[srcName] = cached.Output
+						sourceDiffMu.Unlock()
+
+						if len(cached.ResourceDiffs) > 0 {
+							rep.Warning("Source %s has %d upstream change(s) (cached)", srcName, len(cached.ResourceDiffs))
+						}
+						srcProgress.Complete(srcName)
+						return nil
+					}
+				}
+
+				srcProgress.Update(srcName, "initializing")
+				cli := internal.NewCLIWithConfig(binary, absSrcDir, srcWs.GetPlanConfig())
+				cli.Debug = debug
+				cli.Env = append(cli.Env, srcWs.GetEnvSlice()...)
+				if cfg.TF != nil {
+					cli.Parallelism = cfg.TF.Parallelism
+				}
+
+				// Init is required before plan — PullSourceState may have used cache and skipped init
+				if err := cli.InitWithConfig(ctx, srcWs.GetInitConfig()); err != nil {
+					srcProgress.Fail(srcName, err)
+					return fmt.Errorf("source init failed for %s: %w", srcName, err)
+				}
+
+				srcProgress.Update(srcName, "planning")
+				checkResult, err := cli.PlanHasChanges(ctx)
+				if err != nil {
+					srcProgress.Fail(srcName, err)
+					return fmt.Errorf("source plan failed for %s: %w", srcName, err)
+				}
+
+				diffs := checkResult.ResourceDiffs
+				if len(checkResult.IgnoredErrors) > 0 {
+					rep.Warning("Source %s: ignored errors for %v", srcName, checkResult.IgnoredErrors)
+				}
+
+				// Cache the results (including raw output)
+				if cache != nil {
+					if cacheErr := cache.PutDrift(absSrcDir, srcWs.GetInitConfig(), diffs, checkResult.Output); cacheErr != nil && verbose {
+						fmt.Fprintf(os.Stderr, "Warning: failed to cache drift for %s: %v\n", srcName, cacheErr)
+					}
+				}
+
+				sourceDiffMu.Lock()
+				sourceDiffs[srcName] = diffs
+				sourceOutputs[srcName] = checkResult.Output
+				sourceDiffMu.Unlock()
+
+				if len(diffs) > 0 {
+					rep.Warning("Source %s has %d upstream change(s)", srcName, len(diffs))
+				}
+				srcProgress.Complete(srcName)
+				return nil
+			})
+		}
+		if err := gSrc.Wait(); err != nil {
+			srcProgress.Finish()
+			return err
+		}
+		srcProgress.Finish()
+	}
+
 	// Phase 2: Write cached state to each target (in parallel)
 	rep.Header("Preparing Targets")
 
 	// Build list of targets with their configurations
 	type targetTask struct {
-		name    string
-		absDir  string
-		srcName string
-		cached  *internal.CachedState
+		name          string
+		absDir        string
+		srcName       string
+		cached        *internal.CachedState
+		stateFileName string
 	}
 	var tasks []targetTask
 
@@ -329,10 +429,11 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 		cached := cachedStates[srcName]
 
 		tasks = append(tasks, targetTask{
-			name:    tgtName,
-			absDir:  absTargetDir,
-			srcName: srcName,
-			cached:  cached,
+			name:          tgtName,
+			absDir:        absTargetDir,
+			srcName:       srcName,
+			cached:        cached,
+			stateFileName: tgtWs.GetStateFileName(),
 		})
 	}
 
@@ -350,7 +451,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 		task := task // capture for goroutine
 		g.Go(func() error {
 			progress.Update(task.name, "writing state")
-			if err := copier.WriteStateToTarget(task.cached, task.absDir); err != nil {
+			if err := copier.WriteStateToTarget(task.cached, task.absDir, task.stateFileName); err != nil {
 				progress.Fail(task.name, err)
 				return fmt.Errorf("failed to write state to %s: %w", task.name, err)
 			}
@@ -420,6 +521,28 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 		rep.Warning(w)
 	}
 
+	// Check for cross-workspace dependencies
+	sourceDeps := make(internal.SourceResourceDependencies)
+	for srcName, cached := range cachedStates {
+		if deps, err := internal.ExtractResourceDependencies(cached.StateData); err == nil {
+			sourceDeps[srcName] = deps
+		}
+	}
+	crossDeps := migrationPlan.CheckCrossWorkspaceDependencies(sourceDeps, targetWorkspaces)
+	// Warnings (covered by depends_on) are not printed — they're already acknowledged.
+	if len(crossDeps.Errors) > 0 {
+		rep.Error("Cross-workspace dependencies detected:")
+		for _, cd := range crossDeps.Errors {
+			rep.Error("  %s (workspace %q) depends on %s (workspace %q)",
+				cd.Resource, cd.ResourceWorkspace, cd.Dependency, cd.DependencyWorkspace)
+			rep.Error("  Fix: add depends_on: [%q] to workspace %q in tfsync.yaml",
+				cd.DependencyWorkspace, cd.ResourceWorkspace)
+		}
+		return fmt.Errorf("found %d cross-workspace dependencies; resources that reference "+
+			"resources in other workspaces must be restructured to use terraform_remote_state "+
+			"or tfe_outputs, or add depends_on to acknowledge the relationship", len(crossDeps.Errors))
+	}
+
 	// Show plan summary in verbose mode
 	if verbose {
 		for _, line := range migrationPlan.Summary() {
@@ -434,10 +557,12 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	rep.Header("Running Migrations")
 
 	targetDirMap := make(map[string]string)
+	stateFileNameMap := make(map[string]string)
 	var migrationWsNames []string
 	for wsName, ws := range targetWorkspaces {
 		absDir, _ := filepath.Abs(ws.Path)
 		targetDirMap[wsName] = absDir
+		stateFileNameMap[wsName] = ws.GetStateFileName()
 		migrationWsNames = append(migrationWsNames, wsName)
 	}
 
@@ -454,6 +579,7 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 				migrationProgress.Update(workspace, status)
 			}
 		},
+		stateFileNameMap,
 	)
 	migrationProgress.Finish()
 
@@ -477,6 +603,11 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 	}
 	initProgress := rep.NewParallelProgress(initWsNames)
 
+	// Collect all remote_state data source names per directory path.
+	// This ensures tfsync_vars.tf and remote_state_override.tf contain the
+	// union of all data sources needed by any workspace at that path.
+	pathDataSources := collectRemoteStateDataSources(targetWorkspaces)
+
 	gInit, gInitCtx := errgroup.WithContext(ctx)
 	var initSkipped, initRan int
 	var initMu sync.Mutex
@@ -485,8 +616,12 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 		wsName, ws := wsName, ws
 		gInit.Go(func() error {
 			absDir, _ := filepath.Abs(ws.Path)
-			result, err := copier.InitTargetWithLocalBackendEx(gInitCtx, absDir, func(status string) {
+			result, err := copier.InitTargetWithLocalBackendOpts(gInitCtx, absDir, func(status string) {
 				initProgress.Update(wsName, status)
+			}, internal.InitTargetOpts{
+				Env:                        ws.GetEnvSlice(),
+				StateFileName:              ws.GetStateFileName(),
+				RemoteStateDataSourceNames: pathDataSources[absDir],
 			})
 			if err != nil {
 				initProgress.Fail(wsName, err)
@@ -538,12 +673,21 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 		hasChanges       bool
 		output           string
 		changedAddresses []string
+		resourceDiffs    []internal.ResourceDiff
 		ignoredAddresses []string
 		ignoredErrors    []string
 		err              error
 	}
 
 	levels := internal.TopologicalSort(targetWorkspaces)
+
+	// Build set of workspaces that are dependencies of other workspaces
+	isDependency := make(map[string]bool)
+	for _, ws := range targetWorkspaces {
+		for _, dep := range ws.DependsOn {
+			isDependency[dep] = true
+		}
+	}
 
 	var allPlanResults []planResult
 
@@ -565,11 +709,19 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 				absTargetDir, _ := filepath.Abs(targetWs.Path)
 				cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
 				cli.Debug = debug
+				cli.Env = append(cli.Env, targetWs.GetEnvSlice()...)
 
 				if cfg.TF != nil {
 					cli.Parallelism = cfg.TF.Parallelism
 					cli.VarFiles = cfg.TF.VarFiles
 					cli.Vars = cfg.TF.Vars
+				}
+				// Add per-workspace vars/var_files from PlanConfig
+				if planCfg := targetWs.GetPlanConfig(); planCfg != nil {
+					for k, v := range planCfg.Vars {
+						cli.Vars = append(cli.Vars, k+"="+v)
+					}
+					cli.VarFiles = append(cli.VarFiles, planCfg.VarFiles...)
 				}
 
 				overrideFiles, err := cli.WriteOverrideFiles()
@@ -580,24 +732,39 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 				}
 				defer cli.CleanupOverrideFiles(overrideFiles)
 
+				// Pass remote_state paths as -var flags so multiple workspaces
+				// sharing the same directory can run plans in parallel without
+				// clobbering a shared override file.
+				rsOverrides := buildRemoteStateOverrides(targetWs, absTargetDir, targetWorkspaces)
+				for _, rs := range rsOverrides {
+					cli.Vars = append(cli.Vars, internal.RemoteStateVarName(rs.DataSourceName)+"="+rs.StatePath)
+				}
+
 				checkResult, err := cli.PlanHasChanges(ctx)
 				if err != nil {
 					planProgress.Fail(wsName, err)
-					levelResultsChan <- planResult{workspace: wsName, err: err}
+					// Include any resource diffs parsed from output even on error
+					res := planResult{workspace: wsName, err: err}
+					if checkResult != nil {
+						res.resourceDiffs = checkResult.ResourceDiffs
+						res.changedAddresses = checkResult.ChangedAddresses
+					}
+					levelResultsChan <- res
 					return
 				}
 
-				hasChanges, changedAddrs, ignoredAddrs := filterIgnoredChanges(
-					checkResult.HasChanges, checkResult.ChangedAddresses, targetWs.GetPlanConfig(),
+				filtered := filterIgnoredChanges(
+					checkResult.HasChanges, checkResult.ChangedAddresses, checkResult.ResourceDiffs, targetWs.GetPlanConfig(),
 				)
 
 				planProgress.Complete(wsName)
 				levelResultsChan <- planResult{
 					workspace:        wsName,
-					hasChanges:       hasChanges,
+					hasChanges:       filtered.hasChanges,
 					output:           checkResult.Output,
-					changedAddresses: changedAddrs,
-					ignoredAddresses: ignoredAddrs,
+					changedAddresses: filtered.changedAddresses,
+					resourceDiffs:    filtered.resourceDiffs,
+					ignoredAddresses: filtered.ignoredAddresses,
 					ignoredErrors:    checkResult.IgnoredErrors,
 				}
 			}(wsName, targetWs)
@@ -608,6 +775,74 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 
 		for res := range levelResultsChan {
 			allPlanResults = append(allPlanResults, res)
+		}
+
+		// Inject planned outputs into state for dependency workspaces
+		// so that subsequent levels can read them via terraform_remote_state
+		for _, wsName := range level {
+			if !isDependency[wsName] {
+				continue
+			}
+			targetWs, ok := targetWorkspaces[wsName]
+			if !ok {
+				continue
+			}
+			absTargetDir, _ := filepath.Abs(targetWs.Path)
+
+			// Try extracting outputs from the plan
+			cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
+			cli.Debug = debug
+			cli.Env = append(cli.Env, targetWs.GetEnvSlice()...)
+			if cfg.TF != nil {
+				cli.Parallelism = cfg.TF.Parallelism
+				cli.VarFiles = cfg.TF.VarFiles
+				cli.Vars = cfg.TF.Vars
+			}
+			if planCfg := targetWs.GetPlanConfig(); planCfg != nil {
+				for k, v := range planCfg.Vars {
+					cli.Vars = append(cli.Vars, k+"="+v)
+				}
+				cli.VarFiles = append(cli.VarFiles, planCfg.VarFiles...)
+			}
+
+			outputs, err := cli.PlannedOutputs(ctx)
+			if err != nil {
+				// Plan failed — fall back to static outputs from config
+				if planCfg := targetWs.GetPlanConfig(); planCfg != nil && len(planCfg.FallbackOutputs) > 0 {
+					outputs = make(map[string]interface{})
+					for k, v := range planCfg.FallbackOutputs {
+						outputs[k] = map[string]interface{}{
+							"value": v,
+							"type":  "string",
+						}
+					}
+					if verbose {
+						fmt.Fprintf(os.Stderr, "Using fallback outputs for %s (%d outputs)\n", wsName, len(outputs))
+					}
+				} else {
+					if verbose {
+						fmt.Fprintf(os.Stderr, "Warning: could not extract planned outputs for %s: %v\n", wsName, err)
+					}
+					continue
+				}
+			}
+			if len(outputs) == 0 {
+				continue
+			}
+
+			stateFilePath := filepath.Join(absTargetDir, targetWs.GetStateFileName())
+			sf, err := internal.LoadStateFile(stateFilePath)
+			if err != nil {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Warning: could not load state for output injection in %s: %v\n", wsName, err)
+				}
+				continue
+			}
+			if err := sf.InjectOutputs(outputs); err != nil {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Warning: could not inject outputs for %s: %v\n", wsName, err)
+				}
+			}
 		}
 	}
 	planProgress.Finish()
@@ -622,26 +857,80 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 			firstPlanErr = res.err
 			failedWorkspace = res.workspace
 		}
+		// Look up upstream diffs for this workspace's source, translating
+		// addresses through move/module-move rules so they match target addresses
+		var upstreamDiffs []internal.ResourceDiff
+		if srcName, ok := targetToSource[res.workspace]; ok {
+			rawDiffs := sourceDiffs[srcName]
+			if wp, ok := migrationPlan.WorkspacePlans[res.workspace]; ok {
+				upstreamDiffs = wp.TranslateUpstreamDiffs(rawDiffs)
+			} else {
+				upstreamDiffs = rawDiffs
+			}
+		}
 		planResults = append(planResults, internal.PlanResult{
 			Workspace:        res.workspace,
 			HasChanges:       res.hasChanges,
 			Output:           res.output,
 			ChangedAddresses: res.changedAddresses,
+			ResourceDiffs:    res.resourceDiffs,
 			IgnoredAddresses: res.ignoredAddresses,
 			IgnoredErrors:    res.ignoredErrors,
 			Error:            res.err,
+			UpstreamDiffs:    upstreamDiffs,
 		})
+	}
+
+	// Report results (don't stop on first error — report all, then fail)
+	rep.Header("Plan Results")
+	allPassed := rep.ReportPlanResults(planResults)
+
+	// Write output files
+	diffReport := internal.BuildDiffReport(planResults, allPassed)
+	if err := internal.WriteDiffReport(diffReport); err != nil {
+		rep.Warning("Failed to write diff report: %v", err)
+	}
+
+	targetOutputs := make(map[string]string)
+	for _, res := range planResults {
+		targetOutputs[res.Workspace] = res.Output
+	}
+	if err := internal.WritePlanOutputs(sourceOutputs, targetOutputs); err != nil {
+		rep.Warning("Failed to write plan outputs: %v", err)
+	}
+
+	// Collect and write warnings
+	var warnings []internal.Warning
+	for srcName, diffs := range sourceDiffs {
+		if len(diffs) > 0 {
+			warnings = append(warnings, internal.Warning{
+				Workspace: srcName,
+				Message:   fmt.Sprintf("source has %d upstream change(s)", len(diffs)),
+			})
+		}
+	}
+	for _, res := range planResults {
+		if len(res.IgnoredAddresses) > 0 {
+			warnings = append(warnings, internal.Warning{
+				Workspace: res.Workspace,
+				Message:   fmt.Sprintf("ignored %d changed addresses", len(res.IgnoredAddresses)),
+			})
+		}
+		if len(res.IgnoredErrors) > 0 {
+			warnings = append(warnings, internal.Warning{
+				Workspace: res.Workspace,
+				Message:   fmt.Sprintf("ignored %d errored addresses", len(res.IgnoredErrors)),
+			})
+		}
+	}
+	if err := internal.WriteWarnings(warnings); err != nil {
+		rep.Warning("Failed to write warnings: %v", err)
 	}
 
 	// If any plan failed with an error, report and exit
 	if firstPlanErr != nil {
-		rep.Error("Plan failed for %s: %v", failedWorkspace, firstPlanErr)
 		return fmt.Errorf("plan failed for workspace %s: %w", failedWorkspace, firstPlanErr)
 	}
-
-	// Report results
-	rep.Header("Plan Results")
-	allPassed := rep.ReportPlanResults(planResults)
 
 	// Summary
 	rep.ReportSummary(internal.SummaryResult{
@@ -668,6 +957,9 @@ func runSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Re
 
 // runTargetedSyncWorkflow runs the sync workflow for specific target workspaces only.
 func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *internal.Reporter, targets []string) error {
+	// Clean output directory from previous run
+	internal.CleanOutputDir()
+
 	binary := cfg.TF.GetTool()
 
 	// Create copier with caching enabled
@@ -684,6 +976,8 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 	}
 
 	allSourceWorkspaces := cfg.Source.GetWorkspaces()
+	cfg.Target.AutoSetTFDataDir()
+	cfg.Target.AutoSetSharedPathFiles()
 	allTargetWorkspaces := cfg.Target.GetWorkspaces()
 
 	// Filter to only targeted workspaces
@@ -725,7 +1019,7 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 
 		rep.Step("Pulling state from %s", srcWs.Path)
 
-		pullResult, err := copier.PullSourceState(ctx, absSrcDir, srcWs.GetInitConfig(), refresh)
+		pullResult, err := copier.PullSourceState(ctx, absSrcDir, srcWs.GetInitConfig(), refresh, srcWs.GetEnvSlice()...)
 		if err != nil {
 			rep.Error("Failed to pull source state: %v", err)
 			return err
@@ -744,14 +1038,105 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		rep.Success("Pulled state for %s (%d resources)", srcName, len(pullResult.State.Resources))
 	}
 
+	// Phase 1b: Run plans on source workspaces to detect upstream drift.
+	// Results are cached to avoid re-running expensive source plans on every run.
+	rep.Header("Checking Source Drift")
+
+	sourceDiffs := make(map[string][]internal.ResourceDiff)
+	sourceOutputs := make(map[string]string)
+	var sourceDiffMu sync.Mutex
+
+	{
+		var srcNames []string
+		for name := range allSourceWorkspaces {
+			srcNames = append(srcNames, name)
+		}
+		srcProgress := rep.NewParallelProgress(srcNames)
+		gSrc, _ := errgroup.WithContext(ctx)
+
+		for srcName, srcWs := range allSourceWorkspaces {
+			srcName, srcWs := srcName, srcWs
+			gSrc.Go(func() error {
+				absSrcDir, _ := filepath.Abs(srcWs.Path)
+
+				// Check drift cache (skip if --refresh)
+				if cache != nil && !refresh {
+					cached, err := cache.GetDrift(absSrcDir, srcWs.GetInitConfig())
+					if err == nil && cached != nil {
+						sourceDiffMu.Lock()
+						sourceDiffs[srcName] = cached.ResourceDiffs
+						sourceOutputs[srcName] = cached.Output
+						sourceDiffMu.Unlock()
+
+						if len(cached.ResourceDiffs) > 0 {
+							rep.Warning("Source %s has %d upstream change(s) (cached)", srcName, len(cached.ResourceDiffs))
+						}
+						srcProgress.Complete(srcName)
+						return nil
+					}
+				}
+
+				srcProgress.Update(srcName, "initializing")
+				cli := internal.NewCLIWithConfig(binary, absSrcDir, srcWs.GetPlanConfig())
+				cli.Debug = debug
+				cli.Env = append(cli.Env, srcWs.GetEnvSlice()...)
+				if cfg.TF != nil {
+					cli.Parallelism = cfg.TF.Parallelism
+				}
+
+				// Init is required before plan — PullSourceState may have used cache and skipped init
+				if err := cli.InitWithConfig(ctx, srcWs.GetInitConfig()); err != nil {
+					srcProgress.Fail(srcName, err)
+					return fmt.Errorf("source init failed for %s: %w", srcName, err)
+				}
+
+				srcProgress.Update(srcName, "planning")
+				checkResult, err := cli.PlanHasChanges(ctx)
+				if err != nil {
+					srcProgress.Fail(srcName, err)
+					return fmt.Errorf("source plan failed for %s: %w", srcName, err)
+				}
+
+				diffs := checkResult.ResourceDiffs
+				if len(checkResult.IgnoredErrors) > 0 {
+					rep.Warning("Source %s: ignored errors for %v", srcName, checkResult.IgnoredErrors)
+				}
+
+				// Cache the results (including raw output)
+				if cache != nil {
+					if cacheErr := cache.PutDrift(absSrcDir, srcWs.GetInitConfig(), diffs, checkResult.Output); cacheErr != nil && verbose {
+						fmt.Fprintf(os.Stderr, "Warning: failed to cache drift for %s: %v\n", srcName, cacheErr)
+					}
+				}
+
+				sourceDiffMu.Lock()
+				sourceDiffs[srcName] = diffs
+				sourceOutputs[srcName] = checkResult.Output
+				sourceDiffMu.Unlock()
+
+				if len(diffs) > 0 {
+					rep.Warning("Source %s has %d upstream change(s)", srcName, len(diffs))
+				}
+				srcProgress.Complete(srcName)
+				return nil
+			})
+		}
+		if err := gSrc.Wait(); err != nil {
+			srcProgress.Finish()
+			return err
+		}
+		srcProgress.Finish()
+	}
+
 	// Phase 2: Write cached state to each target (in parallel)
 	rep.Header("Preparing Targets")
 
 	type targetTask struct {
-		name    string
-		absDir  string
-		srcName string
-		cached  *internal.CachedState
+		name          string
+		absDir        string
+		srcName       string
+		cached        *internal.CachedState
+		stateFileName string
 	}
 	var tasks []targetTask
 
@@ -770,10 +1155,11 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		cached := cachedStates[srcName]
 
 		tasks = append(tasks, targetTask{
-			name:    tgtName,
-			absDir:  absTargetDir,
-			srcName: srcName,
-			cached:  cached,
+			name:          tgtName,
+			absDir:        absTargetDir,
+			srcName:       srcName,
+			cached:        cached,
+			stateFileName: tgtWs.GetStateFileName(),
 		})
 	}
 
@@ -790,7 +1176,7 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		task := task
 		g.Go(func() error {
 			progress.Update(task.name, "writing state")
-			if err := copier.WriteStateToTarget(task.cached, task.absDir); err != nil {
+			if err := copier.WriteStateToTarget(task.cached, task.absDir, task.stateFileName); err != nil {
 				progress.Fail(task.name, err)
 				return fmt.Errorf("failed to write state to %s: %w", task.name, err)
 			}
@@ -865,6 +1251,32 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		rep.Warning(w)
 	}
 
+	// Check for cross-workspace dependencies.
+	// Use allTargetWorkspaces (not the filtered targetWorkspaces) so that
+	// depends_on declarations from non-targeted workspaces are included
+	// in the dependency graph — otherwise their cross-workspace deps would
+	// be reported as errors even though they're properly acknowledged.
+	sourceDeps := make(internal.SourceResourceDependencies)
+	for srcName, cached := range cachedStates {
+		if deps, err := internal.ExtractResourceDependencies(cached.StateData); err == nil {
+			sourceDeps[srcName] = deps
+		}
+	}
+	crossDeps := migrationPlan.CheckCrossWorkspaceDependencies(sourceDeps, allTargetWorkspaces)
+	// Warnings (covered by depends_on) are not printed — they're already acknowledged.
+	if len(crossDeps.Errors) > 0 {
+		rep.Error("Cross-workspace dependencies detected:")
+		for _, cd := range crossDeps.Errors {
+			rep.Error("  %s (workspace %q) depends on %s (workspace %q)",
+				cd.Resource, cd.ResourceWorkspace, cd.Dependency, cd.DependencyWorkspace)
+			rep.Error("  Fix: add depends_on: [%q] to workspace %q in tfsync.yaml",
+				cd.DependencyWorkspace, cd.ResourceWorkspace)
+		}
+		return fmt.Errorf("found %d cross-workspace dependencies; resources that reference "+
+			"resources in other workspaces must be restructured to use terraform_remote_state "+
+			"or tfe_outputs, or add depends_on to acknowledge the relationship", len(crossDeps.Errors))
+	}
+
 	if verbose {
 		for _, line := range migrationPlan.Summary() {
 			rep.Detail(line)
@@ -878,10 +1290,12 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 	rep.Header("Running Migrations")
 
 	targetDirMap := make(map[string]string)
+	stateFileNameMap := make(map[string]string)
 	var migrationWsNames []string
 	for wsName, ws := range targetWorkspaces {
 		absDir, _ := filepath.Abs(ws.Path)
 		targetDirMap[wsName] = absDir
+		stateFileNameMap[wsName] = ws.GetStateFileName()
 		migrationWsNames = append(migrationWsNames, wsName)
 	}
 
@@ -898,6 +1312,7 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 				migrationProgress.Update(workspace, status)
 			}
 		},
+		stateFileNameMap,
 	)
 	migrationProgress.Finish()
 
@@ -921,6 +1336,11 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 	}
 	initProgress := rep.NewParallelProgress(initWsNames)
 
+	// Collect all remote_state data source names per directory path.
+	// This ensures tfsync_vars.tf and remote_state_override.tf contain the
+	// union of all data sources needed by any workspace at that path.
+	pathDataSources := collectRemoteStateDataSources(targetWorkspaces)
+
 	gInit, gInitCtx := errgroup.WithContext(ctx)
 	var initSkipped, initRan int
 	var initMu sync.Mutex
@@ -929,8 +1349,12 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		wsName, ws := wsName, ws
 		gInit.Go(func() error {
 			absDir, _ := filepath.Abs(ws.Path)
-			result, err := copier.InitTargetWithLocalBackendEx(gInitCtx, absDir, func(status string) {
+			result, err := copier.InitTargetWithLocalBackendOpts(gInitCtx, absDir, func(status string) {
 				initProgress.Update(wsName, status)
+			}, internal.InitTargetOpts{
+				Env:                        ws.GetEnvSlice(),
+				StateFileName:              ws.GetStateFileName(),
+				RemoteStateDataSourceNames: pathDataSources[absDir],
 			})
 			if err != nil {
 				initProgress.Fail(wsName, err)
@@ -979,12 +1403,21 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 		hasChanges       bool
 		output           string
 		changedAddresses []string
+		resourceDiffs    []internal.ResourceDiff
 		ignoredAddresses []string
 		ignoredErrors    []string
 		err              error
 	}
 
 	levels := internal.TopologicalSort(targetWorkspaces)
+
+	// Build set of workspaces that are dependencies of other workspaces
+	isDependency := make(map[string]bool)
+	for _, ws := range targetWorkspaces {
+		for _, dep := range ws.DependsOn {
+			isDependency[dep] = true
+		}
+	}
 
 	var allPlanResults []planResult
 
@@ -1006,11 +1439,19 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 				absTargetDir, _ := filepath.Abs(targetWs.Path)
 				cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
 				cli.Debug = debug
+				cli.Env = append(cli.Env, targetWs.GetEnvSlice()...)
 
 				if cfg.TF != nil {
 					cli.Parallelism = cfg.TF.Parallelism
 					cli.VarFiles = cfg.TF.VarFiles
 					cli.Vars = cfg.TF.Vars
+				}
+				// Add per-workspace vars/var_files from PlanConfig
+				if planCfg := targetWs.GetPlanConfig(); planCfg != nil {
+					for k, v := range planCfg.Vars {
+						cli.Vars = append(cli.Vars, k+"="+v)
+					}
+					cli.VarFiles = append(cli.VarFiles, planCfg.VarFiles...)
 				}
 
 				overrideFiles, err := cli.WriteOverrideFiles()
@@ -1021,25 +1462,40 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 				}
 				defer cli.CleanupOverrideFiles(overrideFiles)
 
+				// Pass remote_state paths as -var flags so multiple workspaces
+				// sharing the same directory can run plans in parallel without
+				// clobbering a shared override file.
+				rsOverrides := buildRemoteStateOverrides(targetWs, absTargetDir, allTargetWorkspaces)
+				for _, rs := range rsOverrides {
+					cli.Vars = append(cli.Vars, internal.RemoteStateVarName(rs.DataSourceName)+"="+rs.StatePath)
+				}
+
 				checkResult, err := cli.PlanHasChanges(ctx)
 				if err != nil {
 					planProgress.Fail(wsName, err)
-					levelResultsChan <- planResult{workspace: wsName, err: err}
+					// Include any resource diffs parsed from output even on error
+					res := planResult{workspace: wsName, err: err}
+					if checkResult != nil {
+						res.resourceDiffs = checkResult.ResourceDiffs
+						res.changedAddresses = checkResult.ChangedAddresses
+					}
+					levelResultsChan <- res
 					return
 				}
 
 				// Apply ignore_changes filtering
-				hasChanges, changedAddrs, ignoredAddrs := filterIgnoredChanges(
-					checkResult.HasChanges, checkResult.ChangedAddresses, targetWs.GetPlanConfig(),
+				filtered := filterIgnoredChanges(
+					checkResult.HasChanges, checkResult.ChangedAddresses, checkResult.ResourceDiffs, targetWs.GetPlanConfig(),
 				)
 
 				planProgress.Complete(wsName)
 				levelResultsChan <- planResult{
 					workspace:        wsName,
-					hasChanges:       hasChanges,
+					hasChanges:       filtered.hasChanges,
 					output:           checkResult.Output,
-					changedAddresses: changedAddrs,
-					ignoredAddresses: ignoredAddrs,
+					changedAddresses: filtered.changedAddresses,
+					resourceDiffs:    filtered.resourceDiffs,
+					ignoredAddresses: filtered.ignoredAddresses,
 					ignoredErrors:    checkResult.IgnoredErrors,
 				}
 			}(wsName, targetWs)
@@ -1050,6 +1506,74 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 
 		for res := range levelResultsChan {
 			allPlanResults = append(allPlanResults, res)
+		}
+
+		// Inject planned outputs into state for dependency workspaces
+		// so that subsequent levels can read them via terraform_remote_state
+		for _, wsName := range level {
+			if !isDependency[wsName] {
+				continue
+			}
+			targetWs, ok := targetWorkspaces[wsName]
+			if !ok {
+				continue
+			}
+			absTargetDir, _ := filepath.Abs(targetWs.Path)
+
+			// Try extracting outputs from the plan
+			cli := internal.NewCLIWithConfig(binary, absTargetDir, targetWs.GetPlanConfig())
+			cli.Debug = debug
+			cli.Env = append(cli.Env, targetWs.GetEnvSlice()...)
+			if cfg.TF != nil {
+				cli.Parallelism = cfg.TF.Parallelism
+				cli.VarFiles = cfg.TF.VarFiles
+				cli.Vars = cfg.TF.Vars
+			}
+			if planCfg := targetWs.GetPlanConfig(); planCfg != nil {
+				for k, v := range planCfg.Vars {
+					cli.Vars = append(cli.Vars, k+"="+v)
+				}
+				cli.VarFiles = append(cli.VarFiles, planCfg.VarFiles...)
+			}
+
+			outputs, err := cli.PlannedOutputs(ctx)
+			if err != nil {
+				// Plan failed — fall back to static outputs from config
+				if planCfg := targetWs.GetPlanConfig(); planCfg != nil && len(planCfg.FallbackOutputs) > 0 {
+					outputs = make(map[string]interface{})
+					for k, v := range planCfg.FallbackOutputs {
+						outputs[k] = map[string]interface{}{
+							"value": v,
+							"type":  "string",
+						}
+					}
+					if verbose {
+						fmt.Fprintf(os.Stderr, "Using fallback outputs for %s (%d outputs)\n", wsName, len(outputs))
+					}
+				} else {
+					if verbose {
+						fmt.Fprintf(os.Stderr, "Warning: could not extract planned outputs for %s: %v\n", wsName, err)
+					}
+					continue
+				}
+			}
+			if len(outputs) == 0 {
+				continue
+			}
+
+			stateFilePath := filepath.Join(absTargetDir, targetWs.GetStateFileName())
+			sf, err := internal.LoadStateFile(stateFilePath)
+			if err != nil {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Warning: could not load state for output injection in %s: %v\n", wsName, err)
+				}
+				continue
+			}
+			if err := sf.InjectOutputs(outputs); err != nil {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Warning: could not inject outputs for %s: %v\n", wsName, err)
+				}
+			}
 		}
 	}
 	planProgress.Finish()
@@ -1063,24 +1587,80 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 			firstPlanErr = res.err
 			failedWorkspace = res.workspace
 		}
+		// Look up upstream diffs for this workspace's source, translating
+		// addresses through move/module-move rules so they match target addresses
+		var upstreamDiffs []internal.ResourceDiff
+		if srcName, ok := allTargetToSource[res.workspace]; ok {
+			rawDiffs := sourceDiffs[srcName]
+			if wp, ok := migrationPlan.WorkspacePlans[res.workspace]; ok {
+				upstreamDiffs = wp.TranslateUpstreamDiffs(rawDiffs)
+			} else {
+				upstreamDiffs = rawDiffs
+			}
+		}
 		planResults = append(planResults, internal.PlanResult{
 			Workspace:        res.workspace,
 			HasChanges:       res.hasChanges,
 			Output:           res.output,
 			ChangedAddresses: res.changedAddresses,
+			ResourceDiffs:    res.resourceDiffs,
 			IgnoredAddresses: res.ignoredAddresses,
 			IgnoredErrors:    res.ignoredErrors,
 			Error:            res.err,
+			UpstreamDiffs:    upstreamDiffs,
 		})
 	}
 
-	if firstPlanErr != nil {
-		rep.Error("Plan failed for %s: %v", failedWorkspace, firstPlanErr)
-		return fmt.Errorf("plan failed for workspace %s: %w", failedWorkspace, firstPlanErr)
-	}
-
+	// Report results (don't stop on first error — report all, then fail)
 	rep.Header("Plan Results")
 	allPassed := rep.ReportPlanResults(planResults)
+
+	// Write output files
+	diffReport := internal.BuildDiffReport(planResults, allPassed)
+	if err := internal.WriteDiffReport(diffReport); err != nil {
+		rep.Warning("Failed to write diff report: %v", err)
+	}
+
+	targetOutputs := make(map[string]string)
+	for _, res := range planResults {
+		targetOutputs[res.Workspace] = res.Output
+	}
+	if err := internal.WritePlanOutputs(sourceOutputs, targetOutputs); err != nil {
+		rep.Warning("Failed to write plan outputs: %v", err)
+	}
+
+	// Collect and write warnings
+	var warnings []internal.Warning
+	for srcName, diffs := range sourceDiffs {
+		if len(diffs) > 0 {
+			warnings = append(warnings, internal.Warning{
+				Workspace: srcName,
+				Message:   fmt.Sprintf("source has %d upstream change(s)", len(diffs)),
+			})
+		}
+	}
+	for _, res := range planResults {
+		if len(res.IgnoredAddresses) > 0 {
+			warnings = append(warnings, internal.Warning{
+				Workspace: res.Workspace,
+				Message:   fmt.Sprintf("ignored %d changed addresses", len(res.IgnoredAddresses)),
+			})
+		}
+		if len(res.IgnoredErrors) > 0 {
+			warnings = append(warnings, internal.Warning{
+				Workspace: res.Workspace,
+				Message:   fmt.Sprintf("ignored %d errored addresses", len(res.IgnoredErrors)),
+			})
+		}
+	}
+	if err := internal.WriteWarnings(warnings); err != nil {
+		rep.Warning("Failed to write warnings: %v", err)
+	}
+
+	// If any plan failed with an error, report and exit
+	if firstPlanErr != nil {
+		return fmt.Errorf("plan failed for workspace %s: %w", failedWorkspace, firstPlanErr)
+	}
 
 	rep.ReportSummary(internal.SummaryResult{
 		SourceWorkspaces: len(allSourceWorkspaces),
@@ -1103,21 +1683,32 @@ func runTargetedSyncWorkflow(ctx context.Context, cfg *internal.Config, rep *int
 	return nil
 }
 
+// filterIgnoredChangesResult holds the result of filtering ignored changes.
+type filterIgnoredChangesResult struct {
+	hasChanges       bool
+	changedAddresses []string
+	resourceDiffs    []internal.ResourceDiff
+	ignoredAddresses []string
+}
+
 // filterIgnoredChanges filters out changes to addresses in the ignore_changes list.
-// Returns: (stillHasChanges, remainingChangedAddresses, ignoredAddresses)
-func filterIgnoredChanges(hasChanges bool, changedAddresses []string, planCfg *internal.PlanConfig) (bool, []string, []string) {
+func filterIgnoredChanges(hasChanges bool, changedAddresses []string, resourceDiffs []internal.ResourceDiff, planCfg *internal.PlanConfig) filterIgnoredChangesResult {
 	if !hasChanges {
-		return false, nil, nil
+		return filterIgnoredChangesResult{}
 	}
 
 	// No ignore list configured — all changes are real
 	if planCfg == nil || len(planCfg.IgnoreChanges) == 0 {
-		return true, changedAddresses, nil
+		return filterIgnoredChangesResult{
+			hasChanges:       true,
+			changedAddresses: changedAddresses,
+			resourceDiffs:    resourceDiffs,
+		}
 	}
 
 	// If we couldn't get changed addresses (fallback), we can't filter
 	if len(changedAddresses) == 0 {
-		return true, nil, nil
+		return filterIgnoredChangesResult{hasChanges: true}
 	}
 
 	// Build ignore set
@@ -1136,12 +1727,28 @@ func filterIgnoredChanges(hasChanges bool, changedAddresses []string, planCfg *i
 		}
 	}
 
-	// If all changes are ignored, plan passes
-	if len(remaining) == 0 {
-		return false, nil, ignored
+	// Filter resource diffs too
+	var filteredDiffs []internal.ResourceDiff
+	for _, d := range resourceDiffs {
+		if !ignoreSet[d.Address] {
+			filteredDiffs = append(filteredDiffs, d)
+		}
 	}
 
-	return true, remaining, ignored
+	// If all changes are ignored, plan passes
+	if len(remaining) == 0 {
+		return filterIgnoredChangesResult{
+			hasChanges:       false,
+			ignoredAddresses: ignored,
+		}
+	}
+
+	return filterIgnoredChangesResult{
+		hasChanges:       true,
+		changedAddresses: remaining,
+		resourceDiffs:    filteredDiffs,
+		ignoredAddresses: ignored,
+	}
 }
 
 // resolveSourceWorkspaceName determines which source workspace a target should pull from.
@@ -1182,4 +1789,80 @@ func resolveSourceWorkspace(tgtName string, tgtWs internal.Workspace, cfg *inter
 	}
 
 	return "", fmt.Errorf("target %q: source workspace %q not found", tgtName, srcName)
+}
+
+// buildRemoteStateOverrides builds RemoteStateOverride entries for a workspace's
+// depends_on dependencies. Each dependency gets a terraform_remote_state override
+// pointing at the dependency's local state file.
+func buildRemoteStateOverrides(ws internal.Workspace, absDir string, allWorkspaces map[string]internal.Workspace) []internal.RemoteStateOverride {
+	if len(ws.DependsOn) == 0 {
+		return nil
+	}
+	var overrides []internal.RemoteStateOverride
+	for _, depName := range ws.DependsOn {
+		depWs, ok := allWorkspaces[depName]
+		if !ok {
+			continue
+		}
+		absDepDir, _ := filepath.Abs(depWs.Path)
+		depStatePath := filepath.Join(absDepDir, depWs.GetStateFileName())
+		relPath, err := filepath.Rel(absDir, depStatePath)
+		if err != nil {
+			relPath = depStatePath // fallback to absolute
+		}
+
+		// Determine data source name: check remote_state mapping, default to dep name
+		dsName := depName
+		if ws.RemoteState != nil {
+			if mapping, ok := ws.RemoteState[depName]; ok && mapping.DataSource != "" {
+				dsName = mapping.DataSource
+			}
+		}
+
+		overrides = append(overrides, internal.RemoteStateOverride{
+			DataSourceName: dsName,
+			StatePath:      relPath,
+		})
+	}
+	return overrides
+}
+
+// collectRemoteStateDataSources returns the union of all remote_state data source
+// names needed by any workspace at a given path. This is used to write shared
+// tfsync_vars.tf and remote_state_override.tf files that work for all workspaces
+// sharing the directory.
+func collectRemoteStateDataSources(targetWorkspaces map[string]internal.Workspace) map[string][]string {
+	// path -> set of data source names
+	pathDS := make(map[string]map[string]bool)
+
+	for _, ws := range targetWorkspaces {
+		if len(ws.DependsOn) == 0 {
+			continue
+		}
+		absDir, _ := filepath.Abs(ws.Path)
+		if pathDS[absDir] == nil {
+			pathDS[absDir] = make(map[string]bool)
+		}
+		for _, depName := range ws.DependsOn {
+			dsName := depName
+			if ws.RemoteState != nil {
+				if mapping, ok := ws.RemoteState[depName]; ok && mapping.DataSource != "" {
+					dsName = mapping.DataSource
+				}
+			}
+			pathDS[absDir][dsName] = true
+		}
+	}
+
+	// Convert sets to sorted slices
+	result := make(map[string][]string)
+	for path, dsSet := range pathDS {
+		var names []string
+		for name := range dsSet {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		result[path] = names
+	}
+	return result
 }

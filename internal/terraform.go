@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	tfjson "github.com/hashicorp/terraform-json"
@@ -107,8 +108,15 @@ func (c *CLI) InitWithConfig(ctx context.Context, cfg *InitConfig) error {
 		args = append(args, ExpandEnvSlice(cfg.ExtraArgs)...)
 	}
 
-	_, err := c.run(ctx, args...)
-	return err
+	output, err := c.run(ctx, args...)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(output), "initialized in an empty directory") ||
+		strings.Contains(string(output), "has no Terraform configuration files") {
+		return fmt.Errorf("terraform init found no configuration files in %s — check that the source path contains .tf files", c.WorkDir)
+	}
+	return nil
 }
 
 // Plan runs terraform plan and returns the plan output.
@@ -142,6 +150,58 @@ func (c *CLI) Plan(ctx context.Context) (*tfjson.Plan, error) {
 	return &plan, nil
 }
 
+// PlannedOutputs runs a terraform plan and extracts the planned output values.
+// Returns outputs in terraform state file format (map of name -> {"value": ..., "type": ...}).
+// This is used to inject outputs into dependency workspaces' state files so that
+// terraform_remote_state data sources can read them during validation.
+func (c *CLI) PlannedOutputs(ctx context.Context) (map[string]interface{}, error) {
+	plan, err := c.Plan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get plan for outputs: %w", err)
+	}
+
+	if plan.PlannedValues == nil || len(plan.PlannedValues.Outputs) == 0 {
+		return nil, nil
+	}
+
+	outputs := make(map[string]interface{})
+	for name, out := range plan.PlannedValues.Outputs {
+		entry := map[string]interface{}{
+			"value": out.Value,
+			"type":  out.Type,
+		}
+		if out.Sensitive {
+			entry["sensitive"] = true
+		}
+		outputs[name] = entry
+	}
+	return outputs, nil
+}
+
+// ResourceDiff describes a single resource change from a terraform plan.
+type ResourceDiff struct {
+	// Address is the absolute resource address (e.g., "module.foo.aws_instance.bar").
+	Address string `json:"address"`
+	// Action is the change action: "create", "update", "delete", "replace", "read".
+	Action string `json:"action"`
+	// UpstreamChanged indicates this resource also has planned changes in the source workspace.
+	// When true, the diff may be pre-existing drift rather than a migration issue.
+	UpstreamChanged bool `json:"upstream_changed,omitempty"`
+	// UpstreamAction is the action planned for this resource in the source workspace
+	// (only set when UpstreamChanged is true).
+	UpstreamAction string `json:"upstream_action,omitempty"`
+}
+
+// SourcePlanResult holds the results of running a plan on a source workspace.
+type SourcePlanResult struct {
+	// Workspace is the source workspace name.
+	Workspace string
+	// ResourceDiffs are the resource changes detected in the source plan.
+	ResourceDiffs []ResourceDiff
+	// Error is set if the source plan failed entirely.
+	Error error
+}
+
 // PlanCheckResult contains the results of a plan check.
 type PlanCheckResult struct {
 	// HasChanges is true if the plan detected any resource changes.
@@ -151,6 +211,9 @@ type PlanCheckResult struct {
 	// ChangedAddresses is the list of resource addresses that have changes.
 	// Only populated when HasChanges is true.
 	ChangedAddresses []string
+	// ResourceDiffs is the structured list of per-resource changes.
+	// Only populated when HasChanges is true and JSON plan extraction succeeds.
+	ResourceDiffs []ResourceDiff
 	// IgnoredErrors is the list of resource addresses whose errors were ignored.
 	IgnoredErrors []string
 }
@@ -167,8 +230,8 @@ func (c *CLI) PlanHasChanges(ctx context.Context) (*PlanCheckResult, error) {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			// Exit code 2 means changes detected
 			if exitErr.ExitCode() == 2 {
-				// Get JSON plan to extract changed addresses
-				addresses, planErr := c.planChangedAddresses(ctx)
+				// Get JSON plan to extract changed addresses and diffs
+				diffs, planErr := c.planResourceDiffs(ctx)
 				if planErr != nil {
 					// Fall back to reporting changes without addresses
 					return &PlanCheckResult{
@@ -176,10 +239,15 @@ func (c *CLI) PlanHasChanges(ctx context.Context) (*PlanCheckResult, error) {
 						Output:     string(output),
 					}, nil
 				}
+				var addresses []string
+				for _, d := range diffs {
+					addresses = append(addresses, d.Address)
+				}
 				return &PlanCheckResult{
 					HasChanges:       true,
 					Output:           string(output),
 					ChangedAddresses: addresses,
+					ResourceDiffs:    diffs,
 				}, nil
 			}
 			// Exit code 1 means error - check if all errors can be ignored
@@ -195,7 +263,7 @@ func (c *CLI) PlanHasChanges(ctx context.Context) (*PlanCheckResult, error) {
 						}
 					}
 				}
-				if len(errorAddrs) > 0 && allAddressesIgnored(errorAddrs, c.PlanConfig.IgnoreErrors) {
+				if (len(errorAddrs) > 0 || hasWildcardIgnore(c.PlanConfig.IgnoreErrors)) && allAddressesIgnored(errorAddrs, c.PlanConfig.IgnoreErrors) {
 					return &PlanCheckResult{
 						HasChanges:    false,
 						Output:        string(output),
@@ -203,7 +271,18 @@ func (c *CLI) PlanHasChanges(ctx context.Context) (*PlanCheckResult, error) {
 					}, nil
 				}
 			}
-			return nil, fmt.Errorf("plan failed (exit code %d):\n%s", exitErr.ExitCode(), string(output))
+			// Parse resource diffs from text output even on error
+			diffs := parseTextPlanDiffs(string(output))
+			var addresses []string
+			for _, d := range diffs {
+				addresses = append(addresses, d.Address)
+			}
+			return &PlanCheckResult{
+				HasChanges:       len(diffs) > 0,
+				Output:           string(output),
+				ChangedAddresses: addresses,
+				ResourceDiffs:    diffs,
+			}, fmt.Errorf("plan failed (exit code %d):\n%s", exitErr.ExitCode(), string(output))
 		}
 		return nil, err
 	}
@@ -215,27 +294,102 @@ func (c *CLI) PlanHasChanges(ctx context.Context) (*PlanCheckResult, error) {
 	}, nil
 }
 
-// planChangedAddresses runs a JSON plan and extracts addresses of changed resources.
-func (c *CLI) planChangedAddresses(ctx context.Context) ([]string, error) {
+// PlanResourceDiffs runs a JSON plan and extracts per-resource change information.
+// This is the public API; used by the upstream plan diff feature to plan source workspaces.
+func (c *CLI) PlanResourceDiffs(ctx context.Context) ([]ResourceDiff, error) {
+	return c.planResourceDiffs(ctx)
+}
+
+// planResourceDiffs runs a JSON plan and extracts per-resource change information.
+func (c *CLI) planResourceDiffs(ctx context.Context) ([]ResourceDiff, error) {
 	plan, err := c.Plan(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var addresses []string
+	var diffs []ResourceDiff
 	if plan.ResourceChanges != nil {
 		for _, rc := range plan.ResourceChanges {
-			if rc.Change != nil && len(rc.Change.Actions) > 0 {
-				// Skip no-op changes
-				isNoop := len(rc.Change.Actions) == 1 && rc.Change.Actions[0] == tfjson.ActionNoop
-				if !isNoop {
-					addresses = append(addresses, rc.Address)
-				}
+			if rc.Change == nil || len(rc.Change.Actions) == 0 {
+				continue
 			}
+			action := actionsToString(rc.Change.Actions)
+			if action == "no-op" {
+				continue
+			}
+			diffs = append(diffs, ResourceDiff{
+				Address: rc.Address,
+				Action:  action,
+			})
 		}
 	}
 
-	return addresses, nil
+	return diffs, nil
+}
+
+// actionsToString converts terraform plan actions to a human-readable string.
+func actionsToString(actions tfjson.Actions) string {
+	if len(actions) == 1 {
+		return string(actions[0])
+	}
+	if len(actions) == 2 {
+		if actions[0] == tfjson.ActionDelete && actions[1] == tfjson.ActionCreate {
+			return "replace"
+		}
+		if actions[0] == tfjson.ActionCreate && actions[1] == tfjson.ActionDelete {
+			return "replace"
+		}
+	}
+	// Fallback: join action names
+	var parts []string
+	for _, a := range actions {
+		parts = append(parts, string(a))
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseTextPlanDiffs extracts resource diffs from terraform plan text output.
+// This is used as a fallback when JSON plan is unavailable (e.g., exit code 1 errors).
+// It parses lines like:
+//
+//	# module.foo.aws_instance.bar will be created
+//	# module.foo.aws_instance.bar will be updated in-place
+//	# module.foo.aws_instance.bar will be destroyed
+//	# module.foo.aws_instance.bar must be replaced
+//	# module.foo.aws_instance.bar will be read during apply
+var textPlanDiffRe = regexp.MustCompile(
+	`(?m)^\s*#\s+(\S+)\s+(?:will be |must be )(created|updated|destroyed|replaced|read)`,
+)
+
+func parseTextPlanDiffs(output string) []ResourceDiff {
+	// Strip ANSI escape codes
+	ansiRe := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	clean := ansiRe.ReplaceAllString(output, "")
+
+	matches := textPlanDiffRe.FindAllStringSubmatch(clean, -1)
+	var diffs []ResourceDiff
+	seen := map[string]bool{}
+	for _, m := range matches {
+		addr := m[1]
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		action := m[2]
+		// Normalize to match JSON plan action names
+		switch action {
+		case "created":
+			action = "create"
+		case "updated":
+			action = "update"
+		case "destroyed":
+			action = "delete"
+		case "replaced":
+			action = "replace"
+		}
+		diffs = append(diffs, ResourceDiff{Address: addr, Action: action})
+	}
+	return diffs
 }
 
 // StatePull pulls the current state and returns it as JSON bytes.
@@ -463,6 +617,9 @@ func parseErrorResourceAddresses(output string) []string {
 func allAddressesIgnored(addrs []string, ignoreList []string) bool {
 	ignoreSet := make(map[string]bool, len(ignoreList))
 	for _, a := range ignoreList {
+		if a == "*" {
+			return true
+		}
 		ignoreSet[a] = true
 	}
 	for _, a := range addrs {
@@ -471,4 +628,14 @@ func allAddressesIgnored(addrs []string, ignoreList []string) bool {
 		}
 	}
 	return true
+}
+
+// hasWildcardIgnore returns true if the ignore list contains "*".
+func hasWildcardIgnore(ignoreList []string) bool {
+	for _, a := range ignoreList {
+		if a == "*" {
+			return true
+		}
+	}
+	return false
 }

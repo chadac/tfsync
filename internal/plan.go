@@ -48,6 +48,42 @@ type WorkspacePlan struct {
 	ProviderRemaps map[string]string
 }
 
+// TranslateSourceAddress translates a source resource address to the target
+// address space using this workspace's Moves and ModuleMoves mappings.
+// Returns the translated address and true if a mapping was found, or the
+// original address and false if no mapping applies.
+func (wp *WorkspacePlan) TranslateSourceAddress(sourceAddr string) (string, bool) {
+	// Check exact moves first
+	if targetAddr, ok := wp.Moves[sourceAddr]; ok {
+		return targetAddr, true
+	}
+
+	// Check module prefix moves
+	for fromPrefix, toPrefix := range wp.ModuleMoves {
+		if strings.HasPrefix(sourceAddr, fromPrefix+".") {
+			return toPrefix + sourceAddr[len(fromPrefix):], true
+		}
+		if sourceAddr == fromPrefix {
+			return toPrefix, true
+		}
+	}
+
+	// No translation needed — address is the same in source and target (Keep resources)
+	return sourceAddr, false
+}
+
+// TranslateUpstreamDiffs translates a slice of source upstream diffs into the
+// target address space so they can be matched against target plan diffs.
+func (wp *WorkspacePlan) TranslateUpstreamDiffs(diffs []ResourceDiff) []ResourceDiff {
+	translated := make([]ResourceDiff, len(diffs))
+	for i, d := range diffs {
+		translated[i] = d
+		addr, _ := wp.TranslateSourceAddress(d.Address)
+		translated[i].Address = addr
+	}
+	return translated
+}
+
 // resourceAssignment tracks which target workspace a source resource is assigned to.
 type resourceAssignment struct {
 	targetWorkspace string
@@ -166,6 +202,11 @@ func BuildMigrationPlan(
 		toAddr          string
 	}
 	moduleAssignments := make(map[string]*moduleAssignmentEntry) // "sourceWorkspace\x00fromModule" -> assignment
+
+	// Track data sources explicitly assigned to multiple workspaces.
+	// These are allowed because data sources are read-only and can be duplicated.
+	// Key: "srcWorkspace\x00rAddr", Value: set of all target workspaces.
+	duplicatedDataSources := make(map[string]map[string]bool)
 
 	// Collect all validation errors instead of failing on the first one
 	var errs []string
@@ -309,7 +350,22 @@ func BuildMigrationPlan(
 			}
 		} else {
 			// Individual resource move
-			if existing, ok := assignments[assignmentKey(fromWorkspace, fromResource)]; ok {
+			key := assignmentKey(fromWorkspace, fromResource)
+			if existing, ok := assignments[key]; ok {
+				// Data sources can be explicitly duplicated into multiple workspaces
+				if IsDataSourceAddress(fromResource) && existing.targetWorkspace != toWorkspace {
+					if duplicatedDataSources[key] == nil {
+						duplicatedDataSources[key] = map[string]bool{existing.targetWorkspace: true}
+					}
+					duplicatedDataSources[key][toWorkspace] = true
+					// Add to the new workspace's Keep (or Moves if renamed)
+					if fromResource != toResource {
+						wsPlan.Moves[fromResource] = toResource
+					} else {
+						wsPlan.Keep = append(wsPlan.Keep, fromResource)
+					}
+					continue
+				}
 				errs = append(errs, fmt.Sprintf(
 					"%s: resource %q already assigned to target workspace %q\n"+
 						"  first assigned by: %s (source workspace: %q, target workspace: %q)\n"+
@@ -319,7 +375,7 @@ func BuildMigrationPlan(
 					mvRef, fromWorkspace, toWorkspace))
 				continue
 			}
-			assignments[assignmentKey(fromWorkspace, fromResource)] = &resourceAssignment{
+			assignments[key] = &resourceAssignment{
 				targetWorkspace: toWorkspace,
 				sourceWorkspace: fromWorkspace,
 				renamed:         fromResource != toResource,
@@ -390,7 +446,12 @@ func BuildMigrationPlan(
 	for tgtName, wsPlan := range plan.WorkspacePlans {
 		srcResources := sourceResources[wsPlan.SourceWorkspace]
 		for _, rAddr := range srcResources {
-			assignment := assignments[assignmentKey(wsPlan.SourceWorkspace, rAddr)]
+			key := assignmentKey(wsPlan.SourceWorkspace, rAddr)
+			// Duplicated data sources are present in multiple workspaces — don't remove them
+			if dups, ok := duplicatedDataSources[key]; ok && dups[tgtName] {
+				continue
+			}
+			assignment := assignments[key]
 			if assignment != nil && assignment.targetWorkspace != tgtName {
 				wsPlan.Removes = append(wsPlan.Removes, rAddr)
 			}
@@ -633,4 +694,201 @@ func (p *MigrationPlan) TotalRemoves() int {
 		total += len(wsPlan.Removes)
 	}
 	return total
+}
+
+// IsDataSourceAddress checks if a resource address refers to a data source.
+// Handles both top-level "data.x.y" and module-scoped "module.foo.data.x.y".
+func IsDataSourceAddress(addr string) bool {
+	parts := strings.Split(addr, ".")
+	for i, part := range parts {
+		if part == "data" && i+2 < len(parts) {
+			return true
+		}
+	}
+	return false
+}
+
+// CrossWorkspaceDependency describes a dependency that crosses workspace boundaries.
+type CrossWorkspaceDependency struct {
+	// Resource is the resource that has the dependency
+	Resource string
+	// ResourceWorkspace is the target workspace the resource is assigned to
+	ResourceWorkspace string
+	// Dependency is the resource address being depended on
+	Dependency string
+	// DependencyWorkspace is the target workspace the dependency is assigned to
+	DependencyWorkspace string
+	// SourceWorkspace is the source workspace both came from
+	SourceWorkspace string
+}
+
+// CrossWorkspaceDependencyResult categorizes cross-workspace dependencies.
+type CrossWorkspaceDependencyResult struct {
+	// Errors are cross-workspace deps that are not covered by depends_on and are not data sources.
+	Errors []CrossWorkspaceDependency
+	// Warnings are cross-workspace deps that are covered by depends_on (expected/acknowledged).
+	Warnings []CrossWorkspaceDependency
+}
+
+// CheckCrossWorkspaceDependencies checks whether any resource has dependencies
+// on resources assigned to a different target workspace. This detects cases where
+// splitting state would break resource references.
+//
+// sourceDeps maps source workspace name -> resource address -> dependency addresses.
+// targetWorkspaces provides the depends_on graph for filtering expected dependencies.
+// The plan must already be built (resources assigned to workspaces).
+//
+// Dependencies on data sources (data.*) are silently skipped — data sources are
+// read-only and will be re-evaluated in each workspace independently.
+//
+// Dependencies where the resource's workspace declares depends_on the dependency's
+// workspace are reported as warnings (acknowledged/expected) rather than errors.
+func (p *MigrationPlan) CheckCrossWorkspaceDependencies(
+	sourceDeps SourceResourceDependencies,
+	targetWorkspaces map[string]Workspace,
+) CrossWorkspaceDependencyResult {
+	// Build depends_on lookup: workspace -> set of workspaces it depends on
+	dependsOnGraph := make(map[string]map[string]bool)
+	for wsName, ws := range targetWorkspaces {
+		if len(ws.DependsOn) > 0 {
+			dependsOnGraph[wsName] = make(map[string]bool)
+			for _, dep := range ws.DependsOn {
+				dependsOnGraph[wsName][dep] = true
+			}
+		}
+	}
+	// Build a reverse index: for each source workspace, map resource address -> target workspace.
+	// This handles both Keep (same address) and Moves (from-address -> target workspace).
+	// Also track module prefixes for module-level dependency resolution.
+	type wsAssignment struct {
+		targetWorkspace string
+		sourceWorkspace string
+	}
+
+	resourceToTarget := make(map[string]wsAssignment) // "srcWs:addr" -> assignment
+	modulePrefixes := make(map[string]wsAssignment)   // "srcWs:module.foo" -> assignment
+
+	for tgtName, wsPlan := range p.WorkspacePlans {
+		srcWs := wsPlan.SourceWorkspace
+
+		// Resources kept as-is
+		for _, addr := range wsPlan.Keep {
+			key := srcWs + ":" + addr
+			resourceToTarget[key] = wsAssignment{targetWorkspace: tgtName, sourceWorkspace: srcWs}
+		}
+
+		// Resources being moved (index by from-address)
+		for fromAddr := range wsPlan.Moves {
+			key := srcWs + ":" + fromAddr
+			resourceToTarget[key] = wsAssignment{targetWorkspace: tgtName, sourceWorkspace: srcWs}
+		}
+
+		// Module moves — register the module prefix
+		for fromModule := range wsPlan.ModuleMoves {
+			key := srcWs + ":" + fromModule
+			modulePrefixes[key] = wsAssignment{targetWorkspace: tgtName, sourceWorkspace: srcWs}
+		}
+	}
+
+	// resolveWorkspace finds which target workspace a dependency address belongs to.
+	resolveWorkspace := func(srcWs, depAddr string) (string, bool) {
+		// Direct resource match
+		key := srcWs + ":" + depAddr
+		if asgn, ok := resourceToTarget[key]; ok {
+			return asgn.targetWorkspace, true
+		}
+
+		// Module-level match: check if depAddr starts with any registered module prefix
+		for modKey, asgn := range modulePrefixes {
+			if asgn.sourceWorkspace != srcWs {
+				continue
+			}
+			modPrefix := modKey[len(srcWs)+1:] // strip "srcWs:" prefix
+			if depAddr == modPrefix || strings.HasPrefix(depAddr, modPrefix+".") {
+				return asgn.targetWorkspace, true
+			}
+		}
+
+		// Check if depAddr is a resource under any module that was implicitly assigned
+		// by checking all resource assignments for prefix match
+		for resKey, asgn := range resourceToTarget {
+			if asgn.sourceWorkspace != srcWs {
+				continue
+			}
+			resAddr := resKey[len(srcWs)+1:]
+			// If dep is a module and a resource under it is assigned
+			if strings.HasPrefix(resAddr, depAddr+".") {
+				return asgn.targetWorkspace, true
+			}
+		}
+
+		return "", false
+	}
+
+	var result CrossWorkspaceDependencyResult
+
+	// Check each resource's dependencies
+	for srcWs, deps := range sourceDeps {
+		for resAddr, depAddrs := range deps {
+			resKey := srcWs + ":" + resAddr
+			resAsgn, resFound := resourceToTarget[resKey]
+			if !resFound {
+				// Resource not assigned (maybe it's under a module move)
+				// Try to resolve via module prefix
+				resTgt, found := resolveWorkspace(srcWs, resAddr)
+				if !found {
+					continue // resource not in the plan at all
+				}
+				resAsgn = wsAssignment{targetWorkspace: resTgt, sourceWorkspace: srcWs}
+			}
+
+			for _, depAddr := range depAddrs {
+				// Skip data sources — they're read-only and each workspace
+				// will have its own copy after the split
+				if IsDataSourceAddress(depAddr) {
+					continue
+				}
+
+				depTgt, found := resolveWorkspace(srcWs, depAddr)
+				if !found {
+					continue // dependency not in the plan (e.g., data source not tracked)
+				}
+
+				if depTgt != resAsgn.targetWorkspace {
+					cd := CrossWorkspaceDependency{
+						Resource:            resAddr,
+						ResourceWorkspace:   resAsgn.targetWorkspace,
+						Dependency:          depAddr,
+						DependencyWorkspace: depTgt,
+						SourceWorkspace:     srcWs,
+					}
+
+					// If the resource's workspace depends_on the dependency's workspace,
+					// this is an acknowledged/expected cross-workspace reference
+					if deps, ok := dependsOnGraph[resAsgn.targetWorkspace]; ok && deps[depTgt] {
+						result.Warnings = append(result.Warnings, cd)
+					} else {
+						result.Errors = append(result.Errors, cd)
+					}
+				}
+			}
+		}
+	}
+
+	// Sort for deterministic output
+	sortDeps := func(deps []CrossWorkspaceDependency) {
+		sort.Slice(deps, func(i, j int) bool {
+			if deps[i].ResourceWorkspace != deps[j].ResourceWorkspace {
+				return deps[i].ResourceWorkspace < deps[j].ResourceWorkspace
+			}
+			if deps[i].Resource != deps[j].Resource {
+				return deps[i].Resource < deps[j].Resource
+			}
+			return deps[i].Dependency < deps[j].Dependency
+		})
+	}
+	sortDeps(result.Errors)
+	sortDeps(result.Warnings)
+
+	return result
 }

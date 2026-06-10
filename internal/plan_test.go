@@ -880,3 +880,499 @@ func TestBuildMigrationPlan_MultipleErrors(t *testing.T) {
 		t.Errorf("expected third error about also_nonexistent resource in message, got:\n%s", errMsg)
 	}
 }
+
+func TestBuildMigrationPlan_DataSourceExplicitDuplication(t *testing.T) {
+	// Data sources can be explicitly assigned to multiple workspaces via separate moves.
+	cfg := &Migration{
+		Moves: []Move{
+			{From: MoveFrom{Resource: "aws_vpc.main"}, To: MoveTo{Resource: "aws_vpc.main", Workspace: "networking"}},
+			{From: MoveFrom{Resource: "aws_instance.app"}, To: MoveTo{Resource: "aws_instance.app", Workspace: "compute"}},
+			// Same data source explicitly moved to both workspaces
+			{From: MoveFrom{Resource: "data.aws_caller_identity.current"}, To: MoveTo{Resource: "data.aws_caller_identity.current", Workspace: "networking"}},
+			{From: MoveFrom{Resource: "data.aws_caller_identity.current"}, To: MoveTo{Resource: "data.aws_caller_identity.current", Workspace: "compute"}},
+		},
+	}
+
+	sourceResources := SourceWorkspaceResources{
+		"prod": {
+			"aws_vpc.main",
+			"aws_instance.app",
+			"data.aws_caller_identity.current",
+		},
+	}
+
+	targetToSource := map[string]string{
+		"networking": "prod",
+		"compute":    "prod",
+	}
+
+	plan, err := BuildMigrationPlan(cfg, sourceResources, targetToSource, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	networking := plan.WorkspacePlans["networking"]
+	compute := plan.WorkspacePlans["compute"]
+
+	// Data source should be in Keep for both workspaces
+	netKeep := make(map[string]bool)
+	for _, k := range networking.Keep {
+		netKeep[k] = true
+	}
+	compKeep := make(map[string]bool)
+	for _, k := range compute.Keep {
+		compKeep[k] = true
+	}
+
+	if !netKeep["data.aws_caller_identity.current"] {
+		t.Errorf("networking: expected data.aws_caller_identity.current in Keep, got %v", networking.Keep)
+	}
+	if !compKeep["data.aws_caller_identity.current"] {
+		t.Errorf("compute: expected data.aws_caller_identity.current in Keep, got %v", compute.Keep)
+	}
+
+	// Data source should NOT be in Removes for either workspace
+	for _, r := range networking.Removes {
+		if r == "data.aws_caller_identity.current" {
+			t.Errorf("networking: data source should not be in Removes")
+		}
+	}
+	for _, r := range compute.Removes {
+		if r == "data.aws_caller_identity.current" {
+			t.Errorf("compute: data source should not be in Removes")
+		}
+	}
+}
+
+func TestBuildMigrationPlan_DataSourceDuplicationWithRename(t *testing.T) {
+	// Data sources can be duplicated with different names in each workspace
+	cfg := &Migration{
+		Moves: []Move{
+			{From: MoveFrom{Resource: "aws_vpc.main"}, To: MoveTo{Resource: "aws_vpc.main", Workspace: "ws-a"}},
+			{From: MoveFrom{Resource: "aws_instance.app"}, To: MoveTo{Resource: "aws_instance.app", Workspace: "ws-b"}},
+			{From: MoveFrom{Resource: "data.aws_caller_identity.current"}, To: MoveTo{Resource: "data.aws_caller_identity.current", Workspace: "ws-a"}},
+			{From: MoveFrom{Resource: "data.aws_caller_identity.current"}, To: MoveTo{Resource: "data.aws_caller_identity.this", Workspace: "ws-b"}},
+		},
+	}
+
+	sourceResources := SourceWorkspaceResources{
+		"prod": {
+			"aws_vpc.main",
+			"aws_instance.app",
+			"data.aws_caller_identity.current",
+		},
+	}
+
+	targetToSource := map[string]string{
+		"ws-a": "prod",
+		"ws-b": "prod",
+	}
+
+	plan, err := BuildMigrationPlan(cfg, sourceResources, targetToSource, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// ws-a: kept as-is
+	wsA := plan.WorkspacePlans["ws-a"]
+	aKeep := make(map[string]bool)
+	for _, k := range wsA.Keep {
+		aKeep[k] = true
+	}
+	if !aKeep["data.aws_caller_identity.current"] {
+		t.Errorf("ws-a: expected data source in Keep, got %v", wsA.Keep)
+	}
+
+	// ws-b: renamed
+	wsB := plan.WorkspacePlans["ws-b"]
+	if wsB.Moves["data.aws_caller_identity.current"] != "data.aws_caller_identity.this" {
+		t.Errorf("ws-b: expected move data.aws_caller_identity.current -> data.aws_caller_identity.this, got moves: %v", wsB.Moves)
+	}
+}
+
+func TestBuildMigrationPlan_ManagedResourceDuplicationStillErrors(t *testing.T) {
+	// Managed resources should NOT be allowed to duplicate — only data sources
+	cfg := &Migration{
+		Moves: []Move{
+			{From: MoveFrom{Resource: "aws_vpc.main"}, To: MoveTo{Resource: "aws_vpc.main", Workspace: "networking"}},
+			{From: MoveFrom{Resource: "aws_vpc.main"}, To: MoveTo{Resource: "aws_vpc.main", Workspace: "compute"}},
+		},
+	}
+
+	sourceResources := SourceWorkspaceResources{
+		"prod": {"aws_vpc.main"},
+	}
+
+	targetToSource := map[string]string{
+		"networking": "prod",
+		"compute":    "prod",
+	}
+
+	_, err := BuildMigrationPlan(cfg, sourceResources, targetToSource, nil)
+	if err == nil {
+		t.Fatal("expected error for duplicate managed resource assignment")
+	}
+	if !strings.Contains(err.Error(), "already assigned") {
+		t.Errorf("expected 'already assigned' error, got: %v", err)
+	}
+}
+
+func TestCheckCrossWorkspaceDependencies_NoCrossDeps(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"networking": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_vpc.main", "aws_subnet.private"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+			"compute": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_instance.app"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+	targetWs := map[string]Workspace{
+		"networking": {Path: "./networking"},
+		"compute":    {Path: "./compute"},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			"aws_subnet.private": []string{"aws_vpc.main"},     // same workspace
+			"aws_instance.app":   []string{"aws_instance.app"}, // self-dep (ignore)
+		},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetWs)
+	if len(result.Errors) != 0 {
+		t.Errorf("expected no cross-workspace errors, got %d: %+v", len(result.Errors), result.Errors)
+	}
+	if len(result.Warnings) != 0 {
+		t.Errorf("expected no cross-workspace warnings, got %d: %+v", len(result.Warnings), result.Warnings)
+	}
+}
+
+func TestCheckCrossWorkspaceDependencies_CrossDepsDetected(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"networking": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_vpc.main", "aws_subnet.private"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+			"compute": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_instance.app"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+	targetWs := map[string]Workspace{
+		"networking": {Path: "./networking"},
+		"compute":    {Path: "./compute"},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			// app depends on vpc — but they're in different workspaces
+			"aws_instance.app": []string{"aws_vpc.main", "aws_subnet.private"},
+		},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetWs)
+	if len(result.Errors) != 2 {
+		t.Fatalf("expected 2 cross-workspace errors, got %d: %+v", len(result.Errors), result.Errors)
+	}
+	// Both deps should point from compute -> networking
+	for _, cd := range result.Errors {
+		if cd.ResourceWorkspace != "compute" {
+			t.Errorf("expected resource workspace 'compute', got %q", cd.ResourceWorkspace)
+		}
+		if cd.DependencyWorkspace != "networking" {
+			t.Errorf("expected dependency workspace 'networking', got %q", cd.DependencyWorkspace)
+		}
+	}
+}
+
+func TestCheckCrossWorkspaceDependencies_DependsOnSuppressesErrors(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"networking": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_vpc.main", "aws_subnet.private"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+			"compute": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_instance.app"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+	// compute depends_on networking — cross-workspace deps should be warnings, not errors
+	targetWs := map[string]Workspace{
+		"networking": {Path: "./networking"},
+		"compute":    {Path: "./compute", DependsOn: []string{"networking"}},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			"aws_instance.app": []string{"aws_vpc.main", "aws_subnet.private"},
+		},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetWs)
+	if len(result.Errors) != 0 {
+		t.Errorf("expected no errors (depends_on should suppress), got %d: %+v", len(result.Errors), result.Errors)
+	}
+	if len(result.Warnings) != 2 {
+		t.Fatalf("expected 2 warnings, got %d: %+v", len(result.Warnings), result.Warnings)
+	}
+	for _, cd := range result.Warnings {
+		if cd.ResourceWorkspace != "compute" {
+			t.Errorf("expected resource workspace 'compute', got %q", cd.ResourceWorkspace)
+		}
+		if cd.DependencyWorkspace != "networking" {
+			t.Errorf("expected dependency workspace 'networking', got %q", cd.DependencyWorkspace)
+		}
+	}
+}
+
+func TestCheckCrossWorkspaceDependencies_DataSourcesSkipped(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"core": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"data.aws_caller_identity.current", "aws_iam_role.admin"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+			"app": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_s3_bucket.data"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+	targetWs := map[string]Workspace{
+		"core": {Path: "./core"},
+		"app":  {Path: "./app"},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			// app depends on data source in core — should be skipped entirely
+			"aws_s3_bucket.data": []string{"data.aws_caller_identity.current"},
+		},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetWs)
+	if len(result.Errors) != 0 {
+		t.Errorf("expected no errors (data sources should be skipped), got %d: %+v", len(result.Errors), result.Errors)
+	}
+	if len(result.Warnings) != 0 {
+		t.Errorf("expected no warnings (data sources should be skipped), got %d: %+v", len(result.Warnings), result.Warnings)
+	}
+}
+
+func TestCheckCrossWorkspaceDependencies_ModuleDataSourcesSkipped(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"core": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"module.core.data.aws_region.current"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+			"app": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_instance.web"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+	targetWs := map[string]Workspace{
+		"core": {Path: "./core"},
+		"app":  {Path: "./app"},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			// depends on module-scoped data source
+			"aws_instance.web": []string{"module.core.data.aws_region.current"},
+		},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetWs)
+	if len(result.Errors) != 0 {
+		t.Errorf("expected no errors (module data sources should be skipped), got %d: %+v", len(result.Errors), result.Errors)
+	}
+}
+
+func TestCheckCrossWorkspaceDependencies_ModuleMoves(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"networking": {
+				SourceWorkspace: "prod",
+				Keep:            []string{},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{"module.vpc": "module.network"},
+			},
+			"compute": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_instance.app"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+	targetWs := map[string]Workspace{
+		"networking": {Path: "./networking"},
+		"compute":    {Path: "./compute"},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			// app depends on a resource under module.vpc (which is module-moved to networking)
+			"aws_instance.app": []string{"module.vpc.aws_subnet.private"},
+		},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetWs)
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 cross-workspace error, got %d: %+v", len(result.Errors), result.Errors)
+	}
+	if result.Errors[0].ResourceWorkspace != "compute" {
+		t.Errorf("expected resource workspace 'compute', got %q", result.Errors[0].ResourceWorkspace)
+	}
+	if result.Errors[0].DependencyWorkspace != "networking" {
+		t.Errorf("expected dependency workspace 'networking', got %q", result.Errors[0].DependencyWorkspace)
+	}
+}
+
+func TestCheckCrossWorkspaceDependencies_UnknownDepsIgnored(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"networking": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_vpc.main"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+	targetWs := map[string]Workspace{
+		"networking": {Path: "./networking"},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			// depends on something not in the plan at all
+			"aws_vpc.main": []string{"aws_unknown.thing"},
+		},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetWs)
+	if len(result.Errors) != 0 {
+		t.Errorf("expected no cross-workspace errors for unknown dep, got %d: %+v", len(result.Errors), result.Errors)
+	}
+}
+
+// TestCheckCrossWorkspaceDependencies_TargetedSubset simulates the targeted workflow
+// where only a subset of workspaces is passed to CheckCrossWorkspaceDependencies.
+// The plan contains ALL workspaces but targetWorkspaces only has the targeted ones.
+// Cross-workspace deps covered by depends_on should still be warnings, not errors.
+func TestCheckCrossWorkspaceDependencies_TargetedSubset(t *testing.T) {
+	// Full plan built from all workspaces (as runTargetedSyncWorkflow does)
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"networking": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_vpc.main", "aws_subnet.private"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+			"compute": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_instance.app"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			"aws_instance.app": []string{"aws_vpc.main", "aws_subnet.private"},
+		},
+	}
+
+	// Only "compute" is targeted — this is what runTargetedSyncWorkflow passes
+	targetedWorkspaces := map[string]Workspace{
+		"compute": {Path: "./compute", DependsOn: []string{"networking"}},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetedWorkspaces)
+
+	// Cross-workspace deps should be warnings (suppressed by depends_on), not errors
+	if len(result.Errors) != 0 {
+		t.Errorf("expected no errors when only targeted workspace is passed with depends_on, got %d: %+v",
+			len(result.Errors), result.Errors)
+	}
+	if len(result.Warnings) != 2 {
+		t.Errorf("expected 2 warnings for cross-workspace deps, got %d: %+v",
+			len(result.Warnings), result.Warnings)
+	}
+}
+
+// TestCheckCrossWorkspaceDependencies_TargetedSubset_NoDependsOn simulates
+// targeting a single workspace that has cross-workspace deps but no depends_on.
+// This should produce errors.
+func TestCheckCrossWorkspaceDependencies_TargetedSubset_NoDependsOn(t *testing.T) {
+	plan := &MigrationPlan{
+		WorkspacePlans: map[string]*WorkspacePlan{
+			"networking": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_vpc.main"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+			"compute": {
+				SourceWorkspace: "prod",
+				Keep:            []string{"aws_instance.app"},
+				Moves:           map[string]string{},
+				ModuleMoves:     map[string]string{},
+			},
+		},
+	}
+
+	sourceDeps := SourceResourceDependencies{
+		"prod": {
+			"aws_instance.app": []string{"aws_vpc.main"},
+		},
+	}
+
+	// Only "compute" is targeted, WITHOUT depends_on — should error
+	targetedWorkspaces := map[string]Workspace{
+		"compute": {Path: "./compute"},
+	}
+
+	result := plan.CheckCrossWorkspaceDependencies(sourceDeps, targetedWorkspaces)
+
+	if len(result.Errors) != 1 {
+		t.Errorf("expected 1 error for unacknowledged cross-workspace dep, got %d: %+v",
+			len(result.Errors), result.Errors)
+	}
+	if len(result.Warnings) != 0 {
+		t.Errorf("expected 0 warnings, got %d: %+v", len(result.Warnings), result.Warnings)
+	}
+}

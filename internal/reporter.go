@@ -1,15 +1,198 @@
 package internal
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fatih/color"
 )
+
+// DiffReport is the JSON-serializable summary of all plan results.
+type DiffReport struct {
+	Success    bool                     `json:"success"`
+	Workspaces map[string]*WorkspaceDiff `json:"workspaces"`
+}
+
+// WorkspaceDiff summarizes plan results for a single workspace.
+type WorkspaceDiff struct {
+	Status           string         `json:"status"` // "ok", "changes", "error"
+	Error            string         `json:"error,omitempty"`
+	ResourceDiffs    []ResourceDiff `json:"resource_diffs,omitempty"`
+	IgnoredAddresses []string       `json:"ignored_addresses,omitempty"`
+	IgnoredErrors    []string       `json:"ignored_errors,omitempty"`
+	Summary          DiffCounts     `json:"summary"`
+	// UpstreamDiffs lists resource changes detected in the source workspace plan.
+	// These represent pre-existing drift that may explain target plan diffs.
+	UpstreamDiffs []ResourceDiff `json:"upstream_diffs,omitempty"`
+}
+
+// DiffCounts holds per-action counts.
+type DiffCounts struct {
+	Create  int `json:"create"`
+	Update  int `json:"update"`
+	Replace int `json:"replace"`
+	Delete  int `json:"delete"`
+	Read    int `json:"read"`
+}
+
+// BuildDiffReport creates a DiffReport from plan results.
+func BuildDiffReport(results []PlanResult, allPassed bool) *DiffReport {
+	report := &DiffReport{
+		Success:    allPassed,
+		Workspaces: make(map[string]*WorkspaceDiff),
+	}
+
+	for _, res := range results {
+		wsName := res.Workspace
+		if wsName == "" {
+			wsName = "default"
+		}
+
+		// Build upstream lookup: address -> action for cross-referencing
+		upstreamByAddr := make(map[string]string)
+		for _, ud := range res.UpstreamDiffs {
+			upstreamByAddr[ud.Address] = ud.Action
+		}
+
+		// Annotate resource diffs with upstream info
+		annotatedDiffs := make([]ResourceDiff, len(res.ResourceDiffs))
+		copy(annotatedDiffs, res.ResourceDiffs)
+		for i, d := range annotatedDiffs {
+			if upAction, ok := upstreamByAddr[d.Address]; ok {
+				annotatedDiffs[i].UpstreamChanged = true
+				annotatedDiffs[i].UpstreamAction = upAction
+			}
+		}
+
+		wd := &WorkspaceDiff{
+			ResourceDiffs:    annotatedDiffs,
+			IgnoredAddresses: res.IgnoredAddresses,
+			IgnoredErrors:    res.IgnoredErrors,
+			UpstreamDiffs:    res.UpstreamDiffs,
+		}
+
+		if res.Error != nil {
+			wd.Status = "error"
+			wd.Error = res.Error.Error()
+		} else if res.HasChanges {
+			wd.Status = "changes"
+		} else {
+			wd.Status = "ok"
+		}
+
+		// Compute counts
+		for _, d := range annotatedDiffs {
+			switch d.Action {
+			case "create":
+				wd.Summary.Create++
+			case "update":
+				wd.Summary.Update++
+			case "replace":
+				wd.Summary.Replace++
+			case "delete":
+				wd.Summary.Delete++
+			case "read":
+				wd.Summary.Read++
+			}
+		}
+
+		report.Workspaces[wsName] = wd
+	}
+
+	return report
+}
+
+// WriteDiffReport writes the diff report as JSON to .tfsync/diff.json.
+func WriteDiffReport(report *DiffReport) error {
+	if err := os.MkdirAll(OutputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output dir: %w", err)
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal diff report: %w", err)
+	}
+	path := filepath.Join(OutputDir, "diff.json")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write diff report: %w", err)
+	}
+	return nil
+}
+
+// OutputDir is the base directory for all tfsync output files.
+const OutputDir = ".tfsync"
+
+// CleanOutputDir removes stale plan output files from a previous run.
+// Preserves diff.json and warnings.json since those are useful to inspect
+// between runs and get overwritten naturally.
+func CleanOutputDir() error {
+	for _, subdir := range []string{"source", "target"} {
+		dir := filepath.Join(OutputDir, subdir)
+		if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to clean %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// WritePlanOutputs writes raw plan output for each workspace to .tfsync/.
+// sourceOutputs maps source workspace name -> plan text output.
+// targetOutputs maps target workspace name -> plan text output.
+func WritePlanOutputs(sourceOutputs map[string]string, targetOutputs map[string]string) error {
+	for subdir, outputs := range map[string]map[string]string{
+		"source": sourceOutputs,
+		"target": targetOutputs,
+	} {
+		if len(outputs) == 0 {
+			continue
+		}
+		outDir := filepath.Join(OutputDir, subdir)
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			return fmt.Errorf("failed to create output dir %s: %w", outDir, err)
+		}
+		for name, output := range outputs {
+			if output == "" {
+				continue
+			}
+			outPath := filepath.Join(outDir, name+".plan.txt")
+			if err := os.WriteFile(outPath, []byte(output), 0644); err != nil {
+				return fmt.Errorf("failed to write plan output for %s: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Warning represents a collected warning for JSON output.
+type Warning struct {
+	Workspace string `json:"workspace,omitempty"`
+	Message   string `json:"message"`
+}
+
+// WriteWarnings writes collected warnings to .tfsync/warnings.json.
+func WriteWarnings(warnings []Warning) error {
+	if len(warnings) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(OutputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output dir: %w", err)
+	}
+	data, err := json.MarshalIndent(warnings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal warnings: %w", err)
+	}
+	path := filepath.Join(OutputDir, "warnings.json")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write warnings: %w", err)
+	}
+	return nil
+}
 
 // Reporter handles formatted output.
 type Reporter struct {
@@ -94,10 +277,12 @@ type PlanResult struct {
 	Workspace        string
 	HasChanges       bool
 	Output           string
-	ChangedAddresses []string // Resource addresses that have changes
-	IgnoredAddresses []string // Resource addresses that were ignored via config
-	IgnoredErrors    []string // Resource addresses whose errors were ignored via config
+	ChangedAddresses []string       // Resource addresses that have changes
+	ResourceDiffs    []ResourceDiff // Structured per-resource changes
+	IgnoredAddresses []string       // Resource addresses that were ignored via config
+	IgnoredErrors    []string       // Resource addresses whose errors were ignored via config
 	Error            error
+	UpstreamDiffs    []ResourceDiff // Resource changes detected in the source workspace plan
 }
 
 // ReportPlanResults reports the results of plan checks.
@@ -110,15 +295,22 @@ func (r *Reporter) ReportPlanResults(results []PlanResult) bool {
 			prefix = fmt.Sprintf("[%s] ", res.Workspace)
 		}
 
+		wsFile := res.Workspace
+		if wsFile == "" || wsFile == "default" {
+			wsFile = "default"
+		}
+		planPath := filepath.Join(OutputDir, "target", wsFile+".plan.txt")
+
 		if res.Error != nil {
 			r.Error("%sPlan failed: %v", prefix, res.Error)
+			r.Detail("  Full output: %s", planPath)
 			allPassed = false
 		} else if res.HasChanges {
 			r.Error("%sPlan shows changes - migration incomplete", prefix)
-			if res.Output != "" {
-				r.Newline()
-				fmt.Fprintln(r.out, res.Output)
+			if len(res.ResourceDiffs) > 0 {
+				r.reportResourceDiffs(prefix, res.ResourceDiffs)
 			}
+			r.Detail("  Full output: %s", planPath)
 			allPassed = false
 		} else {
 			var notes []string
@@ -147,6 +339,73 @@ func (r *Reporter) ReportPlanResults(results []PlanResult) bool {
 	return allPassed
 }
 
+// reportResourceDiffs prints a structured summary of resource changes.
+func (r *Reporter) reportResourceDiffs(prefix string, diffs []ResourceDiff) {
+	// Build upstream lookup for annotations
+	upstreamInfo := make(map[string]string) // address -> upstream action
+	for _, d := range diffs {
+		if d.UpstreamChanged {
+			upstreamInfo[d.Address] = d.UpstreamAction
+		}
+	}
+
+	// Group by action
+	groups := map[string][]string{}
+	for _, d := range diffs {
+		groups[d.Action] = append(groups[d.Action], d.Address)
+	}
+
+	// Print counts
+	actionOrder := []string{"create", "update", "replace", "delete", "read"}
+	actionSymbols := map[string]string{
+		"create":  "+",
+		"update":  "~",
+		"replace": "-/+",
+		"delete":  "-",
+		"read":    "<=",
+	}
+	for _, action := range actionOrder {
+		addrs := groups[action]
+		if len(addrs) == 0 {
+			continue
+		}
+		sym := actionSymbols[action]
+		if sym == "" {
+			sym = "?"
+		}
+		sort.Strings(addrs)
+		for _, addr := range addrs {
+			suffix := ""
+			if upAction, ok := upstreamInfo[addr]; ok {
+				yellow := color.New(color.FgYellow).SprintFunc()
+				suffix = yellow(fmt.Sprintf(" (also %s upstream)", upAction))
+			}
+			r.Detail("  %s%s %s %s%s", prefix, sym, action, addr, suffix)
+		}
+	}
+	// Handle any unknown actions
+	for action, addrs := range groups {
+		known := false
+		for _, a := range actionOrder {
+			if a == action {
+				known = true
+				break
+			}
+		}
+		if !known {
+			sort.Strings(addrs)
+			for _, addr := range addrs {
+				suffix := ""
+				if upAction, ok := upstreamInfo[addr]; ok {
+					yellow := color.New(color.FgYellow).SprintFunc()
+					suffix = yellow(fmt.Sprintf(" (also %s upstream)", upAction))
+				}
+				r.Detail("  %s? %s %s%s", prefix, action, addr, suffix)
+			}
+		}
+	}
+}
+
 // SummaryResult contains the overall sync result.
 type SummaryResult struct {
 	SourceWorkspaces int
@@ -173,6 +432,13 @@ func (r *Reporter) ReportSummary(result SummaryResult) {
 	} else {
 		r.Error("Migration validation FAILED")
 	}
+
+	r.Newline()
+	r.Detail("Output files:")
+	r.Detail("  %s/diff.json          Structured diff report", OutputDir)
+	r.Detail("  %s/warnings.json      Warnings from this run", OutputDir)
+	r.Detail("  %s/source/<name>.plan.txt Source workspace plan outputs", OutputDir)
+	r.Detail("  %s/target/<name>.plan.txt Target workspace plan outputs", OutputDir)
 }
 
 // DryRunActions prints what would be done in a dry run.

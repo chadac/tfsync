@@ -667,3 +667,135 @@ func TestDeduplicateInstances(t *testing.T) {
 		})
 	}
 }
+
+func TestDeduplicateResources(t *testing.T) {
+	tests := []struct {
+		name          string
+		resources     []StateResource
+		expectedCount int
+	}{
+		{
+			name: "no duplicates",
+			resources: []StateResource{
+				{Type: "aws_instance", Name: "a", Mode: "managed", Instances: []StateResourceInstance{{IndexKey: nil}}},
+				{Type: "aws_instance", Name: "b", Mode: "managed", Instances: []StateResourceInstance{{IndexKey: nil}}},
+			},
+			expectedCount: 2,
+		},
+		{
+			name: "duplicate resource blocks - last wins",
+			resources: []StateResource{
+				{Type: "aws_instance", Name: "a", Mode: "managed", Provider: "aws-old",
+					Instances: []StateResourceInstance{{IndexKey: float64(0), Private: "first"}}},
+				{Type: "aws_instance", Name: "a", Mode: "managed", Provider: "aws-new",
+					Instances: []StateResourceInstance{{IndexKey: float64(1), Private: "second"}}},
+			},
+			expectedCount: 1,
+		},
+		{
+			name: "duplicate with module prefix",
+			resources: []StateResource{
+				{Type: "aws_s3_object", Name: "data", Mode: "managed", Module: "module.foo",
+					Instances: []StateResourceInstance{{IndexKey: float64(0)}}},
+				{Type: "aws_s3_object", Name: "data", Mode: "managed", Module: "module.foo",
+					Instances: []StateResourceInstance{{IndexKey: float64(1)}}},
+			},
+			expectedCount: 1,
+		},
+		{
+			name:          "empty resources",
+			resources:     nil,
+			expectedCount: 0,
+		},
+		{
+			name: "three occurrences - last wins",
+			resources: []StateResource{
+				{Type: "aws_vpc", Name: "main", Mode: "managed"},
+				{Type: "aws_instance", Name: "app", Mode: "managed"},
+				{Type: "aws_vpc", Name: "main", Mode: "managed"},
+			},
+			expectedCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := deduplicateResources(tt.resources)
+			if len(result) != tt.expectedCount {
+				t.Fatalf("got %d resources, want %d", len(result), tt.expectedCount)
+			}
+		})
+	}
+
+	// Verify last-wins behavior: only the last block is kept (matching terraform)
+	t.Run("last block wins entirely - no instance merging", func(t *testing.T) {
+		resources := []StateResource{
+			{Type: "aws_instance", Name: "a", Mode: "managed", Provider: "aws-old",
+				Instances: []StateResourceInstance{{IndexKey: float64(0), Private: "dropped"}}},
+			{Type: "aws_instance", Name: "a", Mode: "managed", Provider: "aws-new",
+				Instances: []StateResourceInstance{{IndexKey: float64(1), Private: "kept"}}},
+		}
+		result := deduplicateResources(resources)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 resource, got %d", len(result))
+		}
+		// Last block wins entirely — only its instances should be present
+		if len(result[0].Instances) != 1 {
+			t.Errorf("expected 1 instance (last block only, no merging), got %d", len(result[0].Instances))
+		}
+		if result[0].Instances[0].Private != "kept" {
+			t.Errorf("expected last block's instance, got Private=%q", result[0].Instances[0].Private)
+		}
+		if result[0].Provider != "aws-new" {
+			t.Errorf("expected provider=aws-new (last wins), got %s", result[0].Provider)
+		}
+	})
+}
+
+func TestLoadStateFromBytes_DeduplicatesResourceBlocks(t *testing.T) {
+	state := TerraformState{
+		Version:          4,
+		TerraformVersion: "1.5.0",
+		Serial:           1,
+		Lineage:          "test",
+		Resources: []StateResource{
+			{
+				Type: "aws_instance", Name: "app", Mode: "managed",
+				Provider: `provider["registry.terraform.io/hashicorp/aws"]`,
+				Instances: []StateResourceInstance{
+					{IndexKey: float64(0), Attributes: map[string]interface{}{"id": "i-dropped"}},
+				},
+			},
+			{
+				Type: "aws_instance", Name: "app", Mode: "managed",
+				Provider: `provider["registry.terraform.io/hashicorp/aws"]`,
+				Instances: []StateResourceInstance{
+					{IndexKey: float64(0), Attributes: map[string]interface{}{"id": "i-kept"}},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sf, err := LoadStateFromBytes(data, "test.tfstate")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resources := sf.GetState().Resources
+	if len(resources) != 1 {
+		t.Fatalf("expected 1 resource after dedup, got %d", len(resources))
+	}
+	// Last block wins — should have only the last block's instance
+	if len(resources[0].Instances) != 1 {
+		t.Fatalf("expected 1 instance (last block wins), got %d", len(resources[0].Instances))
+	}
+	id := resources[0].Instances[0].Attributes["id"]
+	if id != "i-kept" {
+		t.Errorf("expected last block's instance (id=i-kept), got id=%v", id)
+	}
+}

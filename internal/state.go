@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,8 @@ type StateCache struct {
 	// memory holds in-memory cached states for the current session.
 	// Key is the cache key (hash of sourceDir + initCfg).
 	memory map[string]*CachedState
+	// driftMemory holds in-memory cached drift results.
+	driftMemory map[string]*CachedDrift
 }
 
 // CachedState represents cached state data with metadata.
@@ -47,8 +50,9 @@ func NewStateCache(cacheDir string) *StateCache {
 		cacheDir = DefaultCacheDir
 	}
 	return &StateCache{
-		CacheDir: cacheDir,
-		memory:   make(map[string]*CachedState),
+		CacheDir:    cacheDir,
+		memory:      make(map[string]*CachedState),
+		driftMemory: make(map[string]*CachedDrift),
 	}
 }
 
@@ -154,10 +158,97 @@ func (sc *StateCache) Clear(sourceDir string, initCfg *InitConfig) error {
 	return nil
 }
 
+// CachedDrift holds cached source plan drift results.
+type CachedDrift struct {
+	// SourceDir is the absolute path to the source directory.
+	SourceDir string `json:"source_dir"`
+	// CachedAt is when the drift was cached.
+	CachedAt time.Time `json:"cached_at"`
+	// ResourceDiffs are the resource changes detected in the source plan.
+	ResourceDiffs []ResourceDiff `json:"resource_diffs"`
+	// Output is the raw text output from the terraform plan command.
+	Output string `json:"output,omitempty"`
+}
+
+// DriftCacheKey generates a unique cache key for source drift results.
+func (sc *StateCache) DriftCacheKey(sourceDir string, initCfg *InitConfig) string {
+	return "drift-" + sc.CacheKey(sourceDir, initCfg)
+}
+
+// GetDrift retrieves cached drift results if they exist.
+func (sc *StateCache) GetDrift(sourceDir string, initCfg *InitConfig) (*CachedDrift, error) {
+	key := sc.DriftCacheKey(sourceDir, initCfg)
+
+	// Check in-memory cache
+	if cached, ok := sc.driftMemory[key]; ok {
+		return cached, nil
+	}
+
+	// Check disk cache
+	cachePath := sc.CachePath(key)
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read drift cache: %w", err)
+	}
+
+	var cached CachedDrift
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return nil, fmt.Errorf("failed to parse drift cache: %w", err)
+	}
+
+	sc.driftMemory[key] = &cached
+	return &cached, nil
+}
+
+// PutDrift stores drift results in both in-memory and disk cache.
+func (sc *StateCache) PutDrift(sourceDir string, initCfg *InitConfig, diffs []ResourceDiff, output string) error {
+	key := sc.DriftCacheKey(sourceDir, initCfg)
+
+	cached := &CachedDrift{
+		SourceDir:     sourceDir,
+		CachedAt:      time.Now(),
+		ResourceDiffs: diffs,
+		Output:        output,
+	}
+
+	sc.driftMemory[key] = cached
+
+	if err := os.MkdirAll(sc.CacheDir, 0755); err != nil {
+		return fmt.Errorf("failed to create cache dir: %w", err)
+	}
+
+	data, err := json.Marshal(cached)
+	if err != nil {
+		return fmt.Errorf("failed to marshal drift cache: %w", err)
+	}
+
+	if err := os.WriteFile(sc.CachePath(key), data, 0644); err != nil {
+		return fmt.Errorf("failed to write drift cache: %w", err)
+	}
+
+	return nil
+}
+
+// ClearDrift removes cached drift for a source directory.
+func (sc *StateCache) ClearDrift(sourceDir string, initCfg *InitConfig) error {
+	key := sc.DriftCacheKey(sourceDir, initCfg)
+	delete(sc.driftMemory, key)
+
+	cachePath := sc.CachePath(key)
+	if err := os.Remove(cachePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove drift cache: %w", err)
+	}
+	return nil
+}
+
 // ClearAll removes all cached state from both memory and disk.
 func (sc *StateCache) ClearAll() error {
 	// Clear memory
 	sc.memory = make(map[string]*CachedState)
+	sc.driftMemory = make(map[string]*CachedDrift)
 
 	// Clear disk
 	if err := os.RemoveAll(sc.CacheDir); err != nil && !os.IsNotExist(err) {
@@ -215,7 +306,8 @@ type PullResult struct {
 // PullSourceState pulls state from a source terraform config and caches it.
 // If forceRefresh is false and cached state exists, returns the cached state.
 // This does NOT write state to any target - use WriteStateToTarget for that.
-func (c *Copier) PullSourceState(ctx context.Context, sourceDir string, initCfg *InitConfig, forceRefresh bool) (*PullResult, error) {
+// env is optional environment variables (KEY=VALUE format) for the terraform CLI.
+func (c *Copier) PullSourceState(ctx context.Context, sourceDir string, initCfg *InitConfig, forceRefresh bool, env ...string) (*PullResult, error) {
 	// Try to use cached state if not forcing refresh
 	if c.cache != nil && !forceRefresh {
 		cached, err := c.cache.Get(sourceDir, initCfg)
@@ -229,10 +321,23 @@ func (c *Copier) PullSourceState(ctx context.Context, sourceDir string, initCfg 
 		}
 	}
 
-	// Initialize source to connect to its backend
+	// Initialize source to connect to its backend.
+	// When force-refreshing, pass -upgrade to ensure providers are re-downloaded
+	// in case the lock file was updated externally.
+	effectiveInitCfg := initCfg
+	if forceRefresh {
+		if effectiveInitCfg == nil {
+			effectiveInitCfg = &InitConfig{}
+		} else {
+			copied := *effectiveInitCfg
+			effectiveInitCfg = &copied
+		}
+		effectiveInitCfg.ExtraArgs = append(effectiveInitCfg.ExtraArgs, "-upgrade")
+	}
 	sourceCLI := NewCLI(c.binary, sourceDir)
 	sourceCLI.Debug = c.debug
-	if err := sourceCLI.InitWithConfig(ctx, initCfg); err != nil {
+	sourceCLI.Env = append(sourceCLI.Env, env...)
+	if err := sourceCLI.InitWithConfig(ctx, effectiveInitCfg); err != nil {
 		return nil, fmt.Errorf("failed to init source: %w", err)
 	}
 
@@ -277,8 +382,13 @@ func (c *Copier) PullSourceState(ctx context.Context, sourceDir string, initCfg 
 // WriteStateToTarget writes cached state data to a target directory.
 // The state is loaded, deduplicated, and re-serialized to clean up any
 // corrupted state files with duplicate resource instances.
-func (c *Copier) WriteStateToTarget(cached *CachedState, targetDir string) error {
-	localStatePath := filepath.Join(targetDir, "terraform.tfstate")
+// stateFileName overrides the default "terraform.tfstate" name (pass "" for default).
+func (c *Copier) WriteStateToTarget(cached *CachedState, targetDir string, stateFileName ...string) error {
+	sfName := "terraform.tfstate"
+	if len(stateFileName) > 0 && stateFileName[0] != "" {
+		sfName = stateFileName[0]
+	}
+	localStatePath := filepath.Join(targetDir, sfName)
 
 	// Load through StateFile to get deduplication, then re-serialize
 	sf, err := LoadStateFromBytes(cached.StateData, localStatePath)
@@ -416,31 +526,92 @@ func (c *Copier) InitTargetWithLocalBackend(ctx context.Context, targetDir strin
 // StatusCallback is called with status updates during operations.
 type StatusCallback func(status string)
 
+// RemoteStateOverride configures a terraform_remote_state data source override
+// to point at a local state file during validation.
+type RemoteStateOverride struct {
+	DataSourceName string // name in data "terraform_remote_state" "<name>"
+	StatePath      string // relative path from the workspace dir to the dependency's local state file
+}
+
+// InitTargetOpts holds options for InitTargetWithLocalBackendOpts.
+type InitTargetOpts struct {
+	Env                      []string // Additional environment variables (KEY=VALUE format)
+	StateFileName            string   // Override state file name (default: "terraform.tfstate")
+	RemoteStateDataSourceNames []string // Data source names for remote_state overrides (generates tfsync_vars.tf + remote_state_override.tf)
+}
+
 // InitTargetWithLocalBackendEx initializes the target with status callbacks.
 // If the target is already initialized with a local backend, init is skipped.
-func (c *Copier) InitTargetWithLocalBackendEx(ctx context.Context, targetDir string, onStatus StatusCallback) (*InitResult, error) {
+// env is optional additional environment variables (KEY=VALUE format) for the terraform CLI.
+func (c *Copier) InitTargetWithLocalBackendEx(ctx context.Context, targetDir string, onStatus StatusCallback, env ...string) (*InitResult, error) {
+	return c.InitTargetWithLocalBackendOpts(ctx, targetDir, onStatus, InitTargetOpts{Env: env})
+}
+
+// InitTargetWithLocalBackendOpts initializes the target with full options.
+//
+// The override strategy is:
+//  1. backend_override.tf forces `backend "local" {}` (overrides whatever the module declares)
+//  2. `-backend-config=path=<stateFileName>` sets the workspace-specific state path
+//     (overrides the empty path in the override file)
+//
+// This allows multiple workspaces sharing the same directory to each have their
+// own state file while sharing a single backend_override.tf.
+func (c *Copier) InitTargetWithLocalBackendOpts(ctx context.Context, targetDir string, onStatus StatusCallback, opts InitTargetOpts) (*InitResult, error) {
 	notify := func(s string) {
 		if onStatus != nil {
 			onStatus(s)
 		}
 	}
 
+	stateFileName := opts.StateFileName
+	if stateFileName == "" {
+		stateFileName = "terraform.tfstate"
+	}
+
 	overridePath := filepath.Join(targetDir, "backend_override.tf")
 	overrideContent := `# Auto-generated by tfsync - DO NOT COMMIT
 terraform {
-  backend "local" {
-    path = "terraform.tfstate"
-  }
+  backend "local" {}
 }
 `
 
-	// Check if already initialized with local backend
-	if c.isAlreadyInitialized(targetDir, overrideContent) {
+	// Determine the terraform data directory (where .terraform lives)
+	tfDataDir := targetDir
+	for _, e := range opts.Env {
+		if strings.HasPrefix(e, "TF_DATA_DIR=") {
+			tfDataDir = e[len("TF_DATA_DIR="):]
+		}
+	}
+
+	// Write remote_state variable declarations and override files.
+	// These must be written before init (and even when init is skipped)
+	// because terraform needs to see them during both init and plan.
+	// The actual state paths are passed via -var at plan time, so multiple
+	// workspaces sharing the same directory can use different paths without
+	// clobbering each other's override files.
+	if len(opts.RemoteStateDataSourceNames) > 0 {
+		varsContent := GenerateRemoteStateVars(opts.RemoteStateDataSourceNames)
+		varsPath := filepath.Join(targetDir, "tfsync_vars.tf")
+		notify("writing remote state vars")
+		if err := os.WriteFile(varsPath, []byte(varsContent), 0644); err != nil {
+			return nil, fmt.Errorf("failed to write tfsync vars: %w", err)
+		}
+
+		rsContent := GenerateRemoteStateOverride(opts.RemoteStateDataSourceNames)
+		rsPath := filepath.Join(targetDir, "remote_state_override.tf")
+		notify("writing remote state override")
+		if err := os.WriteFile(rsPath, []byte(rsContent), 0644); err != nil {
+			return nil, fmt.Errorf("failed to write remote state override: %w", err)
+		}
+	}
+
+	// Check if already initialized with this backend config
+	if c.isAlreadyInitialized(targetDir, tfDataDir, overrideContent, stateFileName) {
 		notify("already initialized")
 		return &InitResult{Skipped: true}, nil
 	}
 
-	// Write backend override
+	// Write backend override (forces local backend, shared across workspaces)
 	notify("writing backend override")
 	if err := os.WriteFile(overridePath, []byte(overrideContent), 0644); err != nil {
 		return nil, fmt.Errorf("failed to write backend override: %w", err)
@@ -449,20 +620,77 @@ terraform {
 	// Initialize target with local backend.
 	// Use -reconfigure to force switching to the local backend without
 	// attempting to migrate state from the target's original backend.
+	// Use -backend-config=path=<stateFileName> to set the workspace-specific state path.
 	notify("running tofu init")
 	targetCLI := NewCLI(c.binary, targetDir)
 	targetCLI.Debug = c.debug
-	if err := targetCLI.InitWithConfig(ctx, &InitConfig{ExtraArgs: []string{"-reconfigure"}}); err != nil {
+	targetCLI.Env = append(targetCLI.Env, opts.Env...)
+	initArgs := []string{"-reconfigure", fmt.Sprintf("-backend-config=path=%s", stateFileName)}
+	if err := targetCLI.InitWithConfig(ctx, &InitConfig{ExtraArgs: initArgs}); err != nil {
 		return nil, fmt.Errorf("failed to init target: %w", err)
 	}
 
 	return &InitResult{Initialized: true}, nil
 }
 
-// isAlreadyInitialized checks if the target is already initialized with our local backend.
-func (c *Copier) isAlreadyInitialized(targetDir, expectedOverride string) bool {
+// RemoteStateVarName returns the tfsync variable name for a remote state data source.
+func RemoteStateVarName(dataSourceName string) string {
+	// Replace non-alphanumeric characters with underscores for valid HCL variable names
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, dataSourceName)
+	return fmt.Sprintf("tfsync_rs_%s_path", safe)
+}
+
+// GenerateRemoteStateVars generates tfsync_vars.tf content declaring variables
+// for each remote state data source. These variables are passed via -var at plan time,
+// allowing multiple workspaces sharing the same directory to use different state paths.
+func GenerateRemoteStateVars(dataSourceNames []string) string {
+	sorted := make([]string, len(dataSourceNames))
+	copy(sorted, dataSourceNames)
+	sort.Strings(sorted)
+
+	var buf strings.Builder
+	buf.WriteString("# Auto-generated by tfsync - DO NOT COMMIT\n")
+	for _, dsName := range sorted {
+		fmt.Fprintf(&buf, "\nvariable %q {\n", RemoteStateVarName(dsName))
+		buf.WriteString("  type    = string\n")
+		buf.WriteString("  default = \"\"\n")
+		buf.WriteString("}\n")
+	}
+	return buf.String()
+}
+
+// GenerateRemoteStateOverride generates remote_state_override.tf content that overrides
+// terraform_remote_state data sources to use local backend with variable-based paths.
+// The actual paths are passed via -var flags at plan time.
+func GenerateRemoteStateOverride(dataSourceNames []string) string {
+	sorted := make([]string, len(dataSourceNames))
+	copy(sorted, dataSourceNames)
+	sort.Strings(sorted)
+
+	var buf strings.Builder
+	buf.WriteString("# Auto-generated by tfsync - DO NOT COMMIT\n")
+	for _, dsName := range sorted {
+		fmt.Fprintf(&buf, "\ndata \"terraform_remote_state\" %q {\n", dsName)
+		buf.WriteString("  backend = \"local\"\n")
+		buf.WriteString("  config = {\n")
+		fmt.Fprintf(&buf, "    path = var.%s\n", RemoteStateVarName(dsName))
+		buf.WriteString("  }\n")
+		buf.WriteString("}\n")
+	}
+	return buf.String()
+}
+
+// isAlreadyInitialized checks if the target is already initialized with our local backend
+// and the correct state file path.
+// tfDataDir is where .terraform lives (usually targetDir unless TF_DATA_DIR is set).
+func (c *Copier) isAlreadyInitialized(targetDir, tfDataDir, expectedOverride, stateFileName string) bool {
 	// Check for .terraform directory (indicates init has been run)
-	terraformDir := filepath.Join(targetDir, ".terraform")
+	terraformDir := filepath.Join(tfDataDir, ".terraform")
 	if _, err := os.Stat(terraformDir); os.IsNotExist(err) {
 		return false
 	}
@@ -473,9 +701,19 @@ func (c *Copier) isAlreadyInitialized(targetDir, expectedOverride string) bool {
 	if err != nil {
 		return false
 	}
+	if string(data) != expectedOverride {
+		return false
+	}
 
-	// If override content matches, we're already initialized correctly
-	return string(data) == expectedOverride
+	// Check that the state file path in .terraform/terraform.tfstate matches
+	// what we expect. This is how terraform stores the backend config after init.
+	backendStatePath := filepath.Join(tfDataDir, ".terraform", "terraform.tfstate")
+	backendState, err := os.ReadFile(backendStatePath)
+	if err != nil {
+		return false
+	}
+	// Quick check: the backend state should contain our state file name
+	return strings.Contains(string(backendState), stateFileName)
 }
 
 // Cleanup removes generated files from the target directory.
@@ -488,9 +726,13 @@ func (c *Copier) Cleanup(targetDir string) error {
 }
 
 // BackupState creates a backup of the current state in a target directory.
-func (c *Copier) BackupState(targetDir string) (string, error) {
-	statePath := filepath.Join(targetDir, "terraform.tfstate")
-	backupPath := filepath.Join(targetDir, "terraform.tfstate.tfsync-backup")
+func (c *Copier) BackupState(targetDir string, stateFileName ...string) (string, error) {
+	sfName := "terraform.tfstate"
+	if len(stateFileName) > 0 && stateFileName[0] != "" {
+		sfName = stateFileName[0]
+	}
+	statePath := filepath.Join(targetDir, sfName)
+	backupPath := filepath.Join(targetDir, sfName+".tfsync-backup")
 
 	data, err := os.ReadFile(statePath)
 	if err != nil {
@@ -508,7 +750,7 @@ func (c *Copier) BackupState(targetDir string) (string, error) {
 }
 
 // RestoreState restores state from a backup.
-func (c *Copier) RestoreState(targetDir, backupPath string) error {
+func (c *Copier) RestoreState(targetDir, backupPath string, stateFileName ...string) error {
 	if backupPath == "" {
 		return nil // No backup to restore
 	}
@@ -518,7 +760,11 @@ func (c *Copier) RestoreState(targetDir, backupPath string) error {
 		return fmt.Errorf("failed to read backup: %w", err)
 	}
 
-	statePath := filepath.Join(targetDir, "terraform.tfstate")
+	sfName := "terraform.tfstate"
+	if len(stateFileName) > 0 && stateFileName[0] != "" {
+		sfName = stateFileName[0]
+	}
+	statePath := filepath.Join(targetDir, sfName)
 	if err := os.WriteFile(statePath, data, 0644); err != nil {
 		return fmt.Errorf("failed to restore state: %w", err)
 	}

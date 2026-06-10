@@ -10,6 +10,7 @@
 *.dylib
 *.test
 *.out
+/vendor
 
 # IDE
 .idea/
@@ -23,6 +24,12 @@
 .terraform/
 .terraform.lock.hcl
 backend_override.tf
+remote_state_override.tf
+tfsync_vars.tf
 
 # tfsync generated
 *.tfsync-backup
+.tfsync/
+
+# testing
+tfsync-sample-cache/
